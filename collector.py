@@ -201,15 +201,13 @@ def get_contract_last_trading_day(year: int, month: int) -> datetime:
 
 def resolve_active_series_candidates(now_bkk: datetime) -> Tuple[List[str], str, str]:
     """
-    Automatically discovers candidate active contract months without hardcoding.
-    - Options: Strictly Quarterly Series (H, M, U, Z) only.
-    - Futures: Nearest 3 consecutive months + next 3 quarterly months (H, M, U, Z).
+    Automatically discovers candidate active quarterly contract months (H, M, U, Z) without hardcoding.
+    Both S50 Futures and SET50 Options strictly trade quarterly contracts.
     Returns:
-    - candidate_futures_series: List of series suffixes (e.g. ['X26', 'Z26', 'F27', 'H27', 'M27', 'U27'])
-    - front_options_series: Nearest active quarterly contract series (e.g. 'Z26')
-    - next_options_series: Following active quarterly contract series (e.g. 'H27')
+    - candidate_futures_series: List of the 4 active quarterly futures series (e.g. ['Z26', 'H27', 'M27', 'U27'])
+    - front_options_series: Nearest active quarterly options series (e.g. 'Z26')
+    - next_options_series: Following active quarterly options series (e.g. 'H27')
     """
-    # 1. Options: Strictly Quarterly Series (H, M, U, Z)
     active_quarterlies: List[str] = []
     for yr in range(now_bkk.year, now_bkk.year + 3):
         for qm in [3, 6, 9, 12]:
@@ -219,41 +217,13 @@ def resolve_active_series_candidates(now_bkk: datetime) -> Tuple[List[str], str,
                 yr_short = str(yr)[-2:]
                 active_quarterlies.append(f"{code}{yr_short}")
 
+    # Futures: The 4 actively traded quarterly contracts on TFEX (H, M, U, Z)
+    candidate_futures_series = active_quarterlies[:4]
+
+    # Options: Front Series and Next Series (Quarterly only)
     front_opt_series = active_quarterlies[0]
     next_opt_series = active_quarterlies[1]
 
-    # 2. Futures: Nearest 3 consecutive months + next 3 quarterly months
-    y = now_bkk.year
-    m = now_bkk.month
-
-    # Check if current month's futures contract has already expired
-    ltd = get_contract_last_trading_day(y, m)
-    if now_bkk > ltd:
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-
-    # Generate sequence of upcoming months for the next 24 months
-    upcoming_months: List[Tuple[int, int, str]] = []
-    cy, cm = y, m
-    for _ in range(24):
-        code = MONTH_CODES[cm]
-        yr_short = str(cy)[-2:]
-        series_tag = f"{code}{yr_short}"
-        upcoming_months.append((cy, cm, series_tag))
-        cm += 1
-        if cm > 12:
-            cm = 1
-            cy += 1
-
-    consecutive_3 = [item[2] for item in upcoming_months[:3]]
-    quarterly_remaining = [
-        item[2] for item in upcoming_months[3:]
-        if item[1] in QUARTERLY_MONTHS
-    ][:3]
-
-    candidate_futures_series = consecutive_3 + quarterly_remaining
     return candidate_futures_series, front_opt_series, next_opt_series
 
 

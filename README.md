@@ -33,9 +33,9 @@
    - คำนวณหา **Front Series** และ **Next Series** อิงตามวันทำการรองสุดท้าย (Last Trading Day) ของไตรมาสนั้น เช่น ณ เดือนพฤศจิกายน 2026 จะได้ `Z26` (Front) และ `H27` (Next)
    - สแกนครอบคลุมทุก Strike Price ที่เปิดซื้อขายจริงบนกระดาน TFEX ขั้นละ 10 จุด ตั้งแต่ `750 ถึง 1350` และ `ATM ± 250 จุด` ครบทั้ง Call และ Put
    - สัญญาที่ยังไม่เปิดซื้อขาย (API ตอบกลับ 404 / `SettradeError`) สคริปต์จะข้ามอย่างนุ่มนวล (Graceful Fallback) โดยไม่หยุดการทำงาน
-4. **Rollover-Proof Dynamic Discovery**:
-   - ค้นหาสัญญา **S50 Futures** ที่ Active อยู่ในตลาดอัตโนมัติ (3 เดือนต่อเนื่องใกล้สุด + 3 ไตรมาสถัดไป) โดยไม่ Hardcode ชื่อ Series
-   - ค้นหา **Front Series** และ **Next Series** อิงตามวันทำการสุดท้าย (Last Trading Day) ของ TFEX
+4. **Rollover-Proof Quarterly Futures Discovery**:
+   - ค้นหาสัญญา **S50 Futures** เฉพาะรอบไตรมาส 4 สัญญาที่เปิดซื้อขายอยู่บนกระดานจริง (`H`, `M`, `U`, `Z`) โดยไม่ Hardcode ชื่อ Series
+   - ตัดเดือนย่อย (Serial Months) ออกทั้งหมด และมีระบบ Rollover อัตโนมัติเมื่อถึงวันทำการรองสุดท้ายของแต่ละไตรมาส
 5. **Trading Hours & Dual-Layer Holiday Guards**:
    - **ด่านที่ 1 (Static Calendar Holidays)**: บรรจุวันหยุดทำการประจำปี 2026–2027 ของตลาดหลักทรัพย์แห่งประเทศไทย (SET/TFEX) หากตรงกับวันหยุดจะพิมพ์ Log และ `sys.exit(0)` ทันทีโดยไม่แตะ API
    - **ด่านที่ 2 (Ad-hoc / Emergency Holiday Guard)**: เมื่อเวลาปัจจุบันหลัง 09:46 น. (เวลาไทย) สคริปต์จะดึงแท่งเทียน 1 นาทีของ Front Series Futures (`S50Z26`) มาตรวจสอบ หากวันที่ของแท่งเทียนล่าสุดไม่ใช่วันนี้ (`candle_date < today_bkk`) จะถือเป็นวันหยุดฉุกเฉินและ `sys.exit(0)` ทันทีโดยไม่ยิง Options และไม่เขียนข้อมูลลง Turso
