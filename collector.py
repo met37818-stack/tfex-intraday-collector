@@ -53,6 +53,52 @@ MONTH_CODES = {
 QUARTERLY_MONTHS = {3, 6, 9, 12}  # H, M, U, Z
 
 # ==============================================================================
+# SET / TFEX Official Exchange Holidays (2026 - 2027)
+# ==============================================================================
+SET_HOLIDAYS = {
+    # 2026
+    "2026-01-01",  # New Year's Day
+    "2026-01-02",  # Special Holiday
+    "2026-03-03",  # Makha Bucha Day
+    "2026-04-06",  # Chakri Memorial Day
+    "2026-04-13",  # Songkran Festival
+    "2026-04-14",  # Songkran Festival
+    "2026-04-15",  # Songkran Festival
+    "2026-05-01",  # National Labour Day
+    "2026-05-04",  # Coronation Day
+    "2026-06-01",  # Substitution for Visakha Bucha Day (Sun May 31)
+    "2026-06-03",  # H.M. Queen Suthida's Birthday
+    "2026-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
+    "2026-07-29",  # Asahna Bucha Day
+    "2026-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday / Mother's Day
+    "2026-10-13",  # King Bhumibol Adulyadej Memorial Day (Navamindra Maharaj Day)
+    "2026-10-16",  # Special Holiday
+    "2026-10-23",  # Chulalongkorn Day
+    "2026-12-07",  # Substitution for King Bhumibol's Birthday / Father's Day (Sat Dec 5)
+    "2026-12-10",  # Constitution Day
+    "2026-12-31",  # New Year's Eve
+    # 2027
+    "2027-01-01",  # New Year's Day
+    "2027-02-22",  # Substitution for Makha Bucha Day (Sun Feb 21)
+    "2027-04-06",  # Chakri Memorial Day
+    "2027-04-13",  # Songkran Festival
+    "2027-04-14",  # Songkran Festival
+    "2027-04-15",  # Songkran Festival
+    "2027-05-03",  # Substitution for National Labour Day (Sat May 1)
+    "2027-05-04",  # Coronation Day
+    "2027-05-20",  # Visakha Bucha Day
+    "2027-06-03",  # H.M. Queen Suthida's Birthday
+    "2027-07-19",  # Substitution for Asahna Bucha Day (Sun Jul 18)
+    "2027-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
+    "2027-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday / Mother's Day
+    "2027-10-13",  # King Bhumibol Adulyadej Memorial Day
+    "2027-10-25",  # Substitution for Chulalongkorn Day (Sat Oct 23)
+    "2027-12-06",  # Substitution for King Bhumibol's Birthday / Father's Day (Sun Dec 5)
+    "2027-12-10",  # Constitution Day
+    "2027-12-31",  # New Year's Eve
+}
+
+# ==============================================================================
 # Performance & High-Throughput Connection Optimization (60 req/sec Market Data)
 # ==============================================================================
 # 1. Update settrade_v2 default RateLimit to Settrade Market Data specs (60 req/sec)
@@ -549,8 +595,18 @@ def main() -> None:
     timestamp_bkk_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"Collector initiated at {timestamp_bkk_str} (Asia/Bangkok)")
 
-    # 1. Trading Hours Guard
+    # 1. Trading Hours & Calendar Holiday Guard
     if not args.force:
+        # 1.1 Check Static Exchange Holidays (SET/TFEX Official Holidays)
+        today_str = now_bkk.strftime("%Y-%m-%d")
+        if today_str in SET_HOLIDAYS:
+            logger.info(
+                f"[GUARD] Today ({today_str}) is an official SET/TFEX exchange holiday. "
+                f"Terminating gracefully (sys.exit(0)). Use --force to override."
+            )
+            sys.exit(0)
+
+        # 1.2 Check Session Trading Hours
         within_hours, session_desc = is_within_trading_hours(now_bkk)
         if not within_hours:
             logger.info(
@@ -560,7 +616,7 @@ def main() -> None:
             sys.exit(0)
         logger.info(f"[GUARD] Trading hours verified: {session_desc}")
     else:
-        logger.info("[GUARD] --force flag supplied: Bypassing trading hours guard.")
+        logger.info("[GUARD] --force flag supplied: Bypassing trading hours and holiday guards.")
 
     # 2. Read and Validate Environment Variables
     app_id = os.environ.get("SETTRADE_APP_ID", "").strip()
@@ -607,6 +663,33 @@ def main() -> None:
         logger.error(f"Failed to authenticate with Settrade Open API: {e}")
         sys.exit(1)
 
+    # Resolve active series candidates (Rollover proof: Quarterly Options & Rolling Futures)
+    futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
+
+    # 3.1 Ad-hoc / Emergency Holiday Guard (Check latest 1m candle of Front Futures after 09:46)
+    if not args.force and now_bkk.time() >= time(9, 46):
+        front_fut_symbol = f"S50{front_opt_series}"
+        try:
+            logger.info(f"[GUARD] Verifying live market activity on {front_fut_symbol} (time {now_bkk.strftime('%H:%M:%S')} >= 09:46)...")
+            candles = market_data.get_candlestick(front_fut_symbol, interval="1m", limit=1)
+            if candles and "time" in candles and candles["time"]:
+                latest_candle_time = candles["time"][-1]
+                candle_dt = datetime.fromtimestamp(latest_candle_time, BANGKOK_TZ)
+                candle_date = candle_dt.date()
+                today_date = now_bkk.date()
+                if candle_date < today_date:
+                    logger.info(
+                        f"[GUARD] Ad-hoc / Emergency Holiday Detected: Latest 1m candle date for Front Futures {front_fut_symbol} "
+                        f"is {candle_date} (< {today_date}). Market is closed today. Terminating gracefully (sys.exit(0))."
+                    )
+                    sys.exit(0)
+                logger.info(
+                    f"[GUARD] Live market verified: Latest 1m candle for {front_fut_symbol} is from today "
+                    f"({candle_dt.strftime('%Y-%m-%d %H:%M')}). Market is ACTIVE."
+                )
+        except Exception as e:
+            logger.warning(f"Could not verify market open status via {front_fut_symbol}: {e}")
+
     spot_snapshots: List[Dict[str, Any]] = []
     futures_snapshots: List[Dict[str, Any]] = []
     options_snapshots: List[Dict[str, Any]] = []
@@ -639,7 +722,6 @@ def main() -> None:
         logger.warning(f"Failed to fetch SET50 Spot: {e}")
 
     # 5. Discover and Fetch Active S50 Futures
-    futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
     logger.info(f"Evaluating candidate futures series: {futures_candidates}")
 
     front_futures_price: Optional[float] = None

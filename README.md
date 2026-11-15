@@ -36,10 +36,11 @@
 4. **Rollover-Proof Dynamic Discovery**:
    - ค้นหาสัญญา **S50 Futures** ที่ Active อยู่ในตลาดอัตโนมัติ (3 เดือนต่อเนื่องใกล้สุด + 3 ไตรมาสถัดไป) โดยไม่ Hardcode ชื่อ Series
    - ค้นหา **Front Series** และ **Next Series** อิงตามวันทำการสุดท้าย (Last Trading Day) ของ TFEX
-5. **Trading Hours Guard & `--force` Flag**:
-   - ตรวจสอบเวลาประเทศไทย (`Asia/Bangkok`) เฉพาะวันจันทร์–ศุกร์ ช่วงเช้า `09:45 - 12:30` และช่วงบ่าย `14:15 - 16:55`
-   - หากอยู่นอกเวลาทำการ จะแสดง Log และ `sys.exit(0)` ทันทีโดยไม่ยิง API
-   - รองรับคำสั่ง `--force` (`python collector.py --force`) เพื่อบังคับรันตอนตลาดปิดหรือวันหยุด
+5. **Trading Hours & Dual-Layer Holiday Guards**:
+   - **ด่านที่ 1 (Static Calendar Holidays)**: บรรจุวันหยุดทำการประจำปี 2026–2027 ของตลาดหลักทรัพย์แห่งประเทศไทย (SET/TFEX) หากตรงกับวันหยุดจะพิมพ์ Log และ `sys.exit(0)` ทันทีโดยไม่แตะ API
+   - **ด่านที่ 2 (Ad-hoc / Emergency Holiday Guard)**: เมื่อเวลาปัจจุบันหลัง 09:46 น. (เวลาไทย) สคริปต์จะดึงแท่งเทียน 1 นาทีของ Front Series Futures (`S50Z26`) มาตรวจสอบ หากวันที่ของแท่งเทียนล่าสุดไม่ใช่วันนี้ (`candle_date < today_bkk`) จะถือเป็นวันหยุดฉุกเฉินและ `sys.exit(0)` ทันทีโดยไม่ยิง Options และไม่เขียนข้อมูลลง Turso
+   - **การตรวจสอบช่วงเวลาทำการปกติ**: ตรวจสอบเวลาไทย (`Asia/Bangkok`) เฉพาะวันจันทร์–ศุกร์ ช่วงเช้า `09:45 - 12:30` และช่วงบ่าย `14:15 - 16:55`
+   - **`--force` Flag**: ข้ามด่านตรวจเวลาและวันหยุดทั้งหมดเพื่อใช้ทดสอบระบบได้ทุกเมื่อ
 6. **Stateless HTTP Pipeline API Batch Write**:
    - บันทึกข้อมูลลง **Turso Cloud SQLite** ผ่าน endpoint `/v2/pipeline` ด้วย `requests` ใน HTTP Request เดียว (สร้างตารางอัตโนมัติหากยังไม่มี)
    - ปลอดภัย 100% ไม่มีการเปิดเผย Secret หรือ Token ออกมาใน Log
