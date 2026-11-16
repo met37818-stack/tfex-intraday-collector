@@ -2,11 +2,10 @@ name: Collect TFEX 1-Minute Data
 
 on:
   schedule:
-    # Run every 1 minute during TFEX trading sessions (Mon-Fri)
-    # Morning: 09:45 - 12:30 BKK (02:45 - 05:30 UTC)
-    # Afternoon: 14:15 - 16:55 BKK (07:15 - 09:55 UTC)
-    # Covered by UTC hours 2-5 and 7-9
-    - cron: '*/1 2-5,7-9 * * 1-5'
+    # Run every 1 minute during TFEX trading sessions and checkpoint alert windows (Mon-Fri)
+    # Morning: 09:45 - 13:00 BKK (02:45 - 06:00 UTC) -> UTC hours 2-5
+    # Afternoon: 14:15 - 17:30 BKK (07:15 - 10:30 UTC) -> UTC hours 7-10
+    - cron: '*/1 2-5,7-10 * * 1-5'
   workflow_dispatch:
     inputs:
       force_run:
@@ -14,6 +13,11 @@ on:
         type: boolean
         required: true
         default: true
+      notify_only:
+        description: 'Send Telegram status notification only (--notify)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   collect-tfex:
@@ -45,8 +49,13 @@ jobs:
           SETTRADE_IS_SANDBOX: ${{ secrets.SETTRADE_IS_SANDBOX }}
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_run }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.notify_only }}" = "true" ]; then
+            echo "[RUNNER] Manual dispatch with notify_only=true. Executing with --notify flag..."
+            python collector.py --notify
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_run }}" = "true" ]; then
             echo "[RUNNER] Manual dispatch with force_run=true. Executing with --force flag..."
             python collector.py --force
           else

@@ -88,6 +88,32 @@
 | `volume` | REAL | ปริมาณสัญญาซื้อขายรวม |
 | `open_interest` | REAL | สถานะคงค้าง (Open Interest) |
 
+### 4. `intraday_telegram_log` (De-duplication Log for Telegram Alerts)
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `trade_date` | TEXT | วันที่ทำการซื้อขาย (`YYYY-MM-DD`) |
+| `checkpoint` | TEXT | รหัสจุดตรวจ (`MORNING_OPEN`, `MIDDAY_CLOSE`, `AFTERNOON_OPEN`, `EVENING_CLOSE`) |
+| `notified_at_bkk` | TEXT | วันที่และเวลาที่ส่งรายงานแจ้งเตือนสำเร็จ |
+*(PRIMARY KEY: `trade_date`, `checkpoint` เพื่อป้องกันการส่งซ้ำในวันเดียวกัน 100%)*
+
+---
+
+## 📢 ระบบรายงานสถานะผ่าน Telegram (4 Daily Checkpoints)
+
+ระบบส่งสรุปรายงานความสมบูรณ์ของข้อมูล Intraday เข้า Telegram Channel/Chat **วันละ 4 รอบ** เฉพาะวันที่ตลาดเปิดทำการจริง:
+
+1. **`MORNING_OPEN` (10:00 – 10:30 น.):**
+   - รายงานการเปิดตลาดรอบเช้า สถานะการดึงข้อมูล จำนวนแท่งเทียนที่บันทึกได้ และราคา Spot / Front Futures ล่าสุด
+2. **`MIDDAY_CLOSE` (12:30 – 13:00 น.):**
+   - รายงานสรุปจบภาคเช้า ช่วงเวลาบันทึก (Span) จำนวนแท่งเทียนรอบเช้า (เทียบเป้า 165 แท่ง) และประเมินความสมบูรณ์
+3. **`AFTERNOON_OPEN` (14:30 – 15:00 น.):**
+   - รายงานเปิดตลาดรอบบ่าย จำนวนแท่งที่ดึงได้หลัง 14:15 น. พร้อมแจ้งเตือนพิเศษหากไม่มีข้อมูลบันทึกเข้ามา
+4. **`EVENING_CLOSE` (17:00 – 17:30 น.):**
+   - รายงานสรุปปิดตลาดเต็มวัน จำนวนแท่งเทียนรวมทั้งวัน (เทียบเป้า 325 แท่ง), อัตราความสมบูรณ์ (Completeness %), ขนาดฐานข้อมูล Turso (MB/KB) และบทวิเคราะห์ความสมบูรณ์ (Integrity Verdict)
+
+> [!NOTE]
+> **Market-Open Data Guard:** หากวันดังกล่าวไม่มีข้อมูลบันทึกในตาราง Intraday เลย (เช่น วันหยุดราชการ/วันหยุดนักขัตฤกษ์) ระบบจะข้ามการส่งแจ้งเตือนโดยอัตโนมัติ เพื่อไม่ให้มีข้อความรบกวน
+
 ---
 
 ## 🔐 การตั้งค่า Secrets บน GitHub Repository
@@ -103,6 +129,8 @@
 | `SETTRADE_IS_SANDBOX` | กำหนดว่าใช้ Sandbox หรือไม่ | `false` (หรือ `true` หากทดสอบบน UAT) |
 | `TURSO_DATABASE_URL` | URL ของ Turso Database | `libsql://your-db-org.turso.io` |
 | `TURSO_AUTH_TOKEN` | Auth Token ของ Turso Database | `eyJhbGciOi...` |
+| `TELEGRAM_BOT_TOKEN` | Bot Token สำหรับแจ้งเตือนสถานะ | `9267903435:AAEAY...` |
+| `TELEGRAM_CHAT_ID` | Chat ID ปลายทางที่รับการแจ้งเตือน | `1427208361` |
 
 ---
 
@@ -135,15 +163,20 @@
      ```bash
      python collector.py
      ```
-     *(หากรันนอกเวลาทำการ หรือวันเสาร์-อาทิตย์ สคริปต์จะแจ้งเตือนและจบการทำงานทันที)*
+     *(หากรันนอกเวลาทำการ หรือวันเสาร์-อาทิตย์ สคริปต์จะตรวจสอบว่าอยู่ในช่วง Checkpoint หรือไม่ หากอยู่นอกช่วงจะแจ้งเตือนและจบการทำงานทันที)*
 
    - **บังคับรันทันที (Bypass Trading Hours Guard):**
      ```bash
      python collector.py --force
      ```
-   - **กำหนดจำนวน Worker Concurrency (ค่าเริ่มต้น: 12):**
+   - **ทดสอบส่งรายงานสถานะเข้า Telegram ทันที (Manual Test):**
      ```bash
-     python collector.py --force --workers 15
+     python collector.py --notify
+     ```
+     *(ระบบจะดึงข้อมูลล่าสุดจาก Turso มาสรุปส่งเข้า Telegram ทันที โดยไม่บันทึกตัดสิทธิ์รอบจริงในตาราง `intraday_telegram_log`)*
+   - **กำหนดจำนวน Worker Concurrency (ค่าเริ่มต้น: 8):**
+     ```bash
+     python collector.py --force --workers 8 --max-rps 45
      ```
 
 ---
@@ -151,8 +184,9 @@
 ## ⚡ การทำงานบน GitHub Actions
 
 - **ตารางรันอัตโนมัติ (Schedule):**
-  - ตั้ง `cron: '*/1 2-5,7-9 * * 1-5'` รันทุก 1 นาทีในวันจันทร์–ศุกร์ ครอบคลุมช่วงเวลาทำการ TFEX ทั้งรอบเช้าและรอบบ่าย
+  - ตั้ง `cron: '*/1 2-5,7-10 * * 1-5'` รันทุก 1 นาทีในวันจันทร์–ศุกร์ ครอบคลุมทั้งช่วงตลาดทำการและการส่งแจ้งเตือนทั้ง 4 Checkpoints (รอบเช้า 09:45–13:00 น. และรอบบ่าย 14:15–17:30 น. ตามเวลาไทย)
   - ภายใน Job มีการจำกัด `timeout-minutes: 3` และเปิด `cache: 'pip'`
 - **สั่งรันด้วยมือ (Manual Dispatch):**
   - สามารถไปที่แท็บ **Actions** บน GitHub -> เลือก **Collect TFEX 1-Minute Data** -> กด **Run workflow**
-  - จะมีช่องตัวเลือก `force_run` (ติ๊กถูกเป็น `true` โดยเริ่มต้น) เพื่อสั่งดึงข้อมูลและบันทึกลง Turso ได้ทันทีแม้จะอยู่นอกเวลาตลาด
+  - ตัวเลือก `force_run` (ค่าเริ่มต้น: `true`) เพื่อสั่งดึงข้อมูลและบันทึกลง Turso ได้ทันที
+  - ตัวเลือก `notify_only` (ค่าเริ่มต้น: `false`) เพื่อสั่งส่งสรุปสถานะเข้า Telegram ทันทีโดยไม่ดึงข้อมูลใหม่

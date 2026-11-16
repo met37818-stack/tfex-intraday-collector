@@ -367,7 +367,15 @@ def build_turso_pipeline_payload(
         open_interest REAL
     );
     """
-    for ddl in [ddl_spot, ddl_futures, ddl_options]:
+    ddl_telegram_log = """
+    CREATE TABLE IF NOT EXISTS intraday_telegram_log (
+        trade_date TEXT NOT NULL,
+        checkpoint TEXT NOT NULL,
+        notified_at_bkk TEXT NOT NULL,
+        PRIMARY KEY (trade_date, checkpoint)
+    );
+    """
+    for ddl in [ddl_spot, ddl_futures, ddl_options, ddl_telegram_log]:
         requests_list.append({
             "type": "execute",
             "stmt": {"sql": ddl.strip()}
@@ -473,7 +481,466 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
 
 
 # ==============================================================================
-# 5. Worker Task for Option Quote Fetching
+# 5. Turso Query Engine & Telegram Status Checkpoint Alerts
+# ==============================================================================
+def parse_turso_value(val_dict: Dict[str, Any]) -> Any:
+    if not val_dict or val_dict.get("type") == "null":
+        return None
+    val_type = val_dict.get("type")
+    val = val_dict.get("value")
+    if val_type == "integer":
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+    if val_type == "float":
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+    return str(val) if val is not None else None
+
+
+def parse_turso_result_rows(res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cols = [c["name"] for c in res.get("cols", [])]
+    out: List[Dict[str, Any]] = []
+    for row in res.get("rows", []):
+        row_dict: Dict[str, Any] = {}
+        for col_name, val_cell in zip(cols, row):
+            row_dict[col_name] = parse_turso_value(val_cell)
+        out.append(row_dict)
+    return out
+
+
+def query_turso_pipeline(pipeline_url: str, auth_token: str, requests_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {"requests": requests_list}
+    response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=20)
+    if response.status_code != 200:
+        sanitized = response.text.replace(auth_token, "***")
+        raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized}")
+    data = response.json()
+    return data.get("results", [])
+
+
+def ensure_telegram_log_table(pipeline_url: str, auth_token: str) -> None:
+    ddl = """
+    CREATE TABLE IF NOT EXISTS intraday_telegram_log (
+        trade_date TEXT NOT NULL,
+        checkpoint TEXT NOT NULL,
+        notified_at_bkk TEXT NOT NULL,
+        PRIMARY KEY (trade_date, checkpoint)
+    );
+    """
+    reqs = [
+        {"type": "execute", "stmt": {"sql": ddl.strip()}},
+        {"type": "close"}
+    ]
+    try:
+        query_turso_pipeline(pipeline_url, auth_token, reqs)
+    except Exception as e:
+        logger.warning(f"Could not verify intraday_telegram_log table: {e}")
+
+
+def is_checkpoint_already_notified(pipeline_url: str, auth_token: str, trade_date: str, checkpoint: str) -> bool:
+    sql = "SELECT COUNT(*) as cnt FROM intraday_telegram_log WHERE trade_date = ? AND checkpoint = ?;"
+    args = [to_turso_arg(trade_date), to_turso_arg(checkpoint)]
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql, "args": args}},
+        {"type": "close"}
+    ]
+    try:
+        results = query_turso_pipeline(pipeline_url, auth_token, reqs)
+        if results and results[0].get("type") == "ok":
+            res = results[0]["response"]["result"]
+            rows = parse_turso_result_rows(res)
+            if rows and (rows[0].get("cnt") or 0) > 0:
+                return True
+    except Exception as e:
+        logger.warning(f"Error checking intraday_telegram_log for {checkpoint}: {e}")
+    return False
+
+
+def record_telegram_notification(
+    pipeline_url: str,
+    auth_token: str,
+    trade_date: str,
+    checkpoint: str,
+    notified_at: str
+) -> None:
+    sql = """
+    INSERT OR REPLACE INTO intraday_telegram_log (trade_date, checkpoint, notified_at_bkk)
+    VALUES (?, ?, ?);
+    """
+    args = [
+        to_turso_arg(trade_date),
+        to_turso_arg(checkpoint),
+        to_turso_arg(notified_at),
+    ]
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql.strip(), "args": args}},
+        {"type": "close"}
+    ]
+    try:
+        query_turso_pipeline(pipeline_url, auth_token, reqs)
+    except Exception as e:
+        logger.error(f"Failed to record checkpoint {checkpoint} into intraday_telegram_log: {e}")
+
+
+def has_intraday_data_for_date(pipeline_url: str, auth_token: str, trade_date: str) -> bool:
+    sql = f"SELECT COUNT(*) as cnt FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';"
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "close"}
+    ]
+    try:
+        results = query_turso_pipeline(pipeline_url, auth_token, reqs)
+        if results and results[0].get("type") == "ok":
+            res = results[0]["response"]["result"]
+            rows = parse_turso_result_rows(res)
+            if rows and (rows[0].get("cnt") or 0) > 0:
+                return True
+    except Exception as e:
+        logger.warning(f"Error checking intraday data existence for {trade_date}: {e}")
+    return False
+
+
+def get_latest_turso_trade_date(pipeline_url: str, auth_token: str) -> Optional[str]:
+    sql = "SELECT MAX(SUBSTR(captured_at_bkk, 1, 10)) as latest_dt FROM spot_snapshots;"
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "close"}
+    ]
+    try:
+        results = query_turso_pipeline(pipeline_url, auth_token, reqs)
+        if results and results[0].get("type") == "ok":
+            res = results[0]["response"]["result"]
+            rows = parse_turso_result_rows(res)
+            if rows and rows[0].get("latest_dt"):
+                return str(rows[0]["latest_dt"])
+    except Exception as e:
+        logger.warning(f"Error retrieving latest trade date: {e}")
+    return None
+
+
+def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: str) -> Dict[str, Any]:
+    sql_queries = [
+        # 0. spot stats
+        f"SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        # 1. latest spot
+        f"SELECT last, volume, value, captured_at_bkk FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC LIMIT 1;",
+        # 2. futures stats
+        f"SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        # 3. latest front futures
+        f"SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC, symbol ASC LIMIT 1;",
+        # 4. options stats
+        f"SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        # 5. morning bars
+        f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:35:00';",
+        # 6. afternoon bars
+        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 17:00:00';",
+        # 7. pragma page_count
+        "PRAGMA page_count;",
+        # 8. pragma page_size
+        "PRAGMA page_size;"
+    ]
+
+    reqs = [{"type": "execute", "stmt": {"sql": s}} for s in sql_queries]
+    reqs.append({"type": "close"})
+
+    results = query_turso_pipeline(pipeline_url, auth_token, reqs)
+
+    stats: Dict[str, Any] = {}
+
+    def get_first_row(idx: int) -> Dict[str, Any]:
+        if idx < len(results) and results[idx].get("type") == "ok":
+            res = results[idx]["response"]["result"]
+            rows = parse_turso_result_rows(res)
+            if rows:
+                return rows[0]
+        return {}
+
+    # 0. Spot count and bounds
+    r0 = get_first_row(0)
+    stats["spot_count"] = r0.get("spot_count") or 0
+    stats["min_ts"] = r0.get("min_ts") or "-"
+    stats["max_ts"] = r0.get("max_ts") or "-"
+
+    # 1. Latest spot
+    r1 = get_first_row(1)
+    stats["spot_last"] = r1.get("last")
+    stats["spot_vol"] = r1.get("volume") or 0.0
+    stats["spot_val"] = r1.get("value") or 0.0
+
+    # 2. Futures stats
+    r2 = get_first_row(2)
+    stats["fut_count"] = r2.get("fut_count") or 0
+    stats["fut_syms"] = r2.get("fut_syms") or 0
+
+    # 3. Latest front futures
+    r3 = get_first_row(3)
+    stats["fut_symbol"] = r3.get("symbol") or "S50"
+    stats["fut_last"] = r3.get("last")
+    stats["fut_bid"] = r3.get("bid")
+    stats["fut_ask"] = r3.get("ask")
+    stats["fut_oi"] = r3.get("open_interest") or 0.0
+
+    # 4. Options stats
+    r4 = get_first_row(4)
+    stats["opt_count"] = r4.get("opt_count") or 0
+    stats["opt_syms"] = r4.get("opt_syms") or 0
+
+    # 5. Morning bars
+    r5 = get_first_row(5)
+    stats["morning_bars"] = r5.get("morning_bars") or 0
+    stats["min_morning"] = r5.get("min_morning") or "-"
+    stats["max_morning"] = r5.get("max_morning") or "-"
+
+    # 6. Afternoon bars
+    r6 = get_first_row(6)
+    stats["afternoon_bars"] = r6.get("afternoon_bars") or 0
+    stats["min_afternoon"] = r6.get("min_afternoon") or "-"
+    stats["max_afternoon"] = r6.get("max_afternoon") or "-"
+
+    # 7 & 8. Database size
+    r7 = get_first_row(7)
+    r8 = get_first_row(8)
+    page_count = r7.get("page_count") or 0
+    page_size = r8.get("page_size") or 4096
+    db_bytes = page_count * page_size
+    stats["db_pages"] = page_count
+    if db_bytes >= 1024 * 1024:
+        stats["db_size_str"] = f"{db_bytes / (1024 * 1024):.2f} MB"
+    else:
+        stats["db_size_str"] = f"{db_bytes / 1024:.1f} KB"
+
+    return stats
+
+
+def get_current_checkpoint(t: time) -> Optional[str]:
+    # Checkpoint 1: 10:00 - 10:30 (Morning Open)
+    if time(10, 0) <= t <= time(10, 30):
+        return "MORNING_OPEN"
+    # Checkpoint 2: 12:30 - 13:00 (Midday Break)
+    if time(12, 30) <= t <= time(13, 0):
+        return "MIDDAY_CLOSE"
+    # Checkpoint 3: 14:30 - 15:00 (Afternoon Open)
+    if time(14, 30) <= t <= time(15, 0):
+        return "AFTERNOON_OPEN"
+    # Checkpoint 4: 17:00 - 17:30 (Evening Close)
+    if time(17, 0) <= t <= time(17, 30):
+        return "EVENING_CLOSE"
+    return None
+
+
+def build_checkpoint_message(
+    checkpoint: str,
+    trade_date: str,
+    now_bkk: datetime,
+    stats: Dict[str, Any],
+    is_manual: bool = False
+) -> str:
+    date_str = now_bkk.strftime("%Y%m%d")
+    time_str = now_bkk.strftime("%H:%M")
+
+    topic_map = {
+        "MORNING_OPEN": "Morning Open Status",
+        "MIDDAY_CLOSE": "Midday Break Report",
+        "AFTERNOON_OPEN": "Afternoon Open Status",
+        "EVENING_CLOSE": "Full-Day Close Summary",
+        "MANUAL_REPORT": "Manual Status Inspection"
+    }
+    topic_desc = topic_map.get(checkpoint, checkpoint)
+
+    header = (
+        f"Date: {date_str} | Time : {time_str} | Topic : TFEX Collector - {topic_desc}\n"
+        f"Model : Settrade v2 Collector | API No: Turso SQLite Pipeline"
+    )
+
+    spot_count = stats.get("spot_count", 0)
+    spot_last = stats.get("spot_last")
+    spot_vol = stats.get("spot_vol", 0.0)
+
+    fut_count = stats.get("fut_count", 0)
+    fut_sym = stats.get("fut_symbol", "S50")
+    fut_last = stats.get("fut_last")
+    fut_oi = stats.get("fut_oi", 0.0)
+
+    opt_count = stats.get("opt_count", 0)
+    opt_syms = stats.get("opt_syms", 0)
+
+    morning_bars = stats.get("morning_bars", 0)
+    afternoon_bars = stats.get("afternoon_bars", 0)
+    min_ts = stats.get("min_ts", "-")
+    max_ts = stats.get("max_ts", "-")
+    db_size = stats.get("db_size_str", "-")
+    db_pages = stats.get("db_pages", 0)
+
+    spot_str = f"{spot_last:.2f}" if spot_last is not None else "N/A"
+    fut_str = f"{fut_last:.2f}" if fut_last is not None else "N/A"
+
+    mode_tag = " <i>(Manual Test Trigger)</i>" if is_manual else ""
+
+    if checkpoint == "MORNING_OPEN":
+        body = (
+            f"🔔 <b>TFEX INTRADAY: MORNING OPEN STATUS</b>{mode_tag}\n\n"
+            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:30)\n"
+            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
+            f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
+            f"• <b>Bars Captured (Today):</b> <b>{spot_count}</b> bars\n"
+            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> (Vol: {spot_vol:,.0f})\n"
+            f"• <b>Front Futures ({fut_sym}):</b> <code>{fut_str}</code> (OI: {fut_oi:,.0f})\n"
+            f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts ({opt_count} snaps)\n"
+            f"• <b>Storage:</b> Turso SQLite {db_size}"
+        )
+    elif checkpoint == "MIDDAY_CLOSE":
+        m_pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
+        health = "🟢 Complete" if morning_bars >= 160 else "⚠️ Missing Bars"
+        body = (
+            f"☕ <b>TFEX INTRADAY: MIDDAY BREAK REPORT</b>{mode_tag}\n\n"
+            f"• <b>Status:</b> ⏸️ Morning Session Closed\n"
+            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
+            f"• <b>Morning Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
+            f"• <b>Morning Bars:</b> <b>{morning_bars}</b> / 165 ({m_pct:.1f}%)\n"
+            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
+            f"• <b>Snapshots:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
+            f"• <b>Health Check:</b> {health}\n"
+            f"• <b>Storage:</b> Turso SQLite {db_size}"
+        )
+    elif checkpoint == "AFTERNOON_OPEN":
+        warn = "\n⚠️ <b>Alert:</b> No bars captured yet for afternoon session!" if afternoon_bars == 0 else ""
+        body = (
+            f"📈 <b>TFEX INTRADAY: AFTERNOON OPEN STATUS</b>{mode_tag}\n\n"
+            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 16:55)\n"
+            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
+            f"• <b>Afternoon Bars (since 14:15):</b> <b>{afternoon_bars}</b> bars\n"
+            f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
+            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
+            f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts\n"
+            f"• <b>Storage:</b> Turso SQLite {db_size}{warn}"
+        )
+    else:  # EVENING_CLOSE or MANUAL_REPORT
+        total_expected = 325.0
+        c_pct = (spot_count / total_expected) * 100.0 if spot_count else 0.0
+        if c_pct >= 98:
+            verdict = "✅ Excellent (≥98%)"
+        elif c_pct >= 90:
+            verdict = "⚠️ Good (≥90%)"
+        else:
+            verdict = f"🚨 Incomplete ({c_pct:.1f}%)"
+
+        title = "🏁 <b>TFEX INTRADAY: FULL-DAY CLOSE SUMMARY</b>" if checkpoint == "EVENING_CLOSE" else "📊 <b>TFEX INTRADAY: CURRENT STATUS REPORT</b>"
+        body = (
+            f"{title}{mode_tag}\n\n"
+            f"• <b>Status:</b> 🔒 Market Closed\n"
+            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
+            f"• <b>Trading Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
+            f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 325 ({c_pct:.1f}%)\n"
+            f"  - Morning (09:45-12:30): {morning_bars} bars\n"
+            f"  - Afternoon (14:15-16:55): {afternoon_bars} bars\n"
+            f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
+            f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
+            f"• <b>Database Storage:</b> <b>{db_size}</b> ({db_pages} pages)\n"
+            f"• <b>Integrity Verdict:</b> {verdict}"
+        )
+
+    return f"{header}\n\n{body}"
+
+
+def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        resp = _http_session.post(url, json=payload, timeout=10)
+        if resp.status_code == 200 and resp.json().get("ok"):
+            logger.info("Telegram alert sent successfully.")
+            return True
+        else:
+            logger.error(f"Telegram API returned status {resp.status_code}: {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to deliver Telegram message: {e}")
+        return False
+
+
+def check_and_send_checkpoints(
+    now_bkk: datetime,
+    pipeline_url: str,
+    turso_token: str,
+    bot_token: str,
+    chat_id: str,
+    force_notify: bool = False
+) -> bool:
+    if not bot_token or not chat_id:
+        logger.warning("[TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Checkpoint alerts skipped.")
+        return False
+
+    ensure_telegram_log_table(pipeline_url, turso_token)
+
+    today_str = now_bkk.strftime("%Y-%m-%d")
+    current_time = now_bkk.time()
+
+    if force_notify:
+        checkpoint = get_current_checkpoint(current_time) or "MANUAL_REPORT"
+        target_date = today_str
+        has_today = has_intraday_data_for_date(pipeline_url, turso_token, today_str)
+        if not has_today:
+            latest_dt = get_latest_turso_trade_date(pipeline_url, turso_token)
+            if latest_dt:
+                target_date = latest_dt
+                logger.info(f"[NOTIFY] No intraday data for today ({today_str}). Falling back to latest trade date in Turso: {target_date}")
+            else:
+                logger.warning("[NOTIFY] Turso database contains no intraday data at all.")
+                return False
+
+        stats = query_turso_intraday_stats(pipeline_url, turso_token, target_date)
+        msg = build_checkpoint_message(checkpoint, target_date, now_bkk, stats, is_manual=True)
+        logger.info(f"[NOTIFY] Sending Telegram report for {target_date} (Checkpoint: {checkpoint})...")
+        return send_telegram_message(bot_token, chat_id, msg)
+
+    # Automated schedule rules:
+    # 1. Mon - Fri only
+    if now_bkk.weekday() > 4:
+        return False
+
+    # 2. Determine checkpoint
+    checkpoint = get_current_checkpoint(current_time)
+    if not checkpoint:
+        return False
+
+    # 3. Check de-duplication log
+    if is_checkpoint_already_notified(pipeline_url, turso_token, today_str, checkpoint):
+        logger.info(f"[TELEGRAM] Checkpoint {checkpoint} for {today_str} already sent today. Skipping.")
+        return False
+
+    # 4. Market-Open Data Guard
+    if not has_intraday_data_for_date(pipeline_url, turso_token, today_str):
+        logger.info(f"[TELEGRAM] Market-Open Data Guard: No intraday data collected for {today_str}. Skipping {checkpoint} alert.")
+        return False
+
+    # 5. Query stats & send
+    stats = query_turso_intraday_stats(pipeline_url, turso_token, today_str)
+    msg = build_checkpoint_message(checkpoint, today_str, now_bkk, stats, is_manual=False)
+
+    logger.info(f"[TELEGRAM] Triggering {checkpoint} alert for {today_str}...")
+    success = send_telegram_message(bot_token, chat_id, msg)
+    if success:
+        now_ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+        record_telegram_notification(pipeline_url, turso_token, today_str, checkpoint, now_ts_str)
+        logger.info(f"[TELEGRAM] Recorded checkpoint {checkpoint} for {today_str} into intraday_telegram_log.")
+    return success
+
+
+# ==============================================================================
+# 6. Worker Task for Option Quote Fetching
 # ==============================================================================
 def fetch_option_quote_task(
     market_data: Any,
@@ -545,6 +1012,11 @@ def main() -> None:
         help="Bypass trading hours guard and force execution immediately."
     )
     parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Manually trigger and send the latest intraday status report to Telegram."
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
@@ -565,6 +1037,32 @@ def main() -> None:
     timestamp_bkk_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"Collector initiated at {timestamp_bkk_str} (Asia/Bangkok)")
 
+    # Read and Validate Environment Variables
+    app_id = os.environ.get("SETTRADE_APP_ID", "").strip()
+    app_secret = os.environ.get("SETTRADE_APP_SECRET", "").strip()
+    broker_id = os.environ.get("SETTRADE_BROKER_ID", "").strip()
+    app_code = os.environ.get("SETTRADE_APP_CODE", "ALGO").strip() or "ALGO"
+    is_sandbox_raw = os.environ.get("SETTRADE_IS_SANDBOX", "false").strip().lower()
+    is_sandbox = is_sandbox_raw in ("true", "1", "yes")
+
+    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    # Handle manual Telegram notification trigger (--notify)
+    if args.notify:
+        if not turso_url or not turso_token:
+            logger.error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN for --notify mode.")
+            sys.exit(1)
+        turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
+        logger.info("[NOTIFY] Executing manual Telegram status report...")
+        success = check_and_send_checkpoints(
+            now_bkk, turso_pipeline_url, turso_token,
+            telegram_bot_token, telegram_chat_id, force_notify=True
+        )
+        sys.exit(0 if success else 1)
+
     # 1. Trading Hours & Calendar Holiday Guard
     if not args.force:
         # 1.1 Check Static Exchange Holidays (SET/TFEX Official Holidays)
@@ -579,6 +1077,16 @@ def main() -> None:
         # 1.2 Check Session Trading Hours
         within_hours, session_desc = is_within_trading_hours(now_bkk)
         if not within_hours:
+            # Check if current time falls within off-market checkpoint windows (MIDDAY_CLOSE or EVENING_CLOSE)
+            curr_chk = get_current_checkpoint(now_bkk.time())
+            if curr_chk in ("MIDDAY_CLOSE", "EVENING_CLOSE") and turso_url and turso_token and telegram_bot_token:
+                turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
+                logger.info(f"[CHECKPOINT] Current time is within {curr_chk} window. Running checkpoint alert evaluation...")
+                check_and_send_checkpoints(
+                    now_bkk, turso_pipeline_url, turso_token,
+                    telegram_bot_token, telegram_chat_id, force_notify=False
+                )
+
             logger.info(
                 f"[GUARD] Current time {now_bkk.strftime('%A %H:%M:%S')} is outside TFEX trading sessions "
                 f"({session_desc}). Terminating gracefully. Use --force to override."
@@ -588,17 +1096,7 @@ def main() -> None:
     else:
         logger.info("[GUARD] --force flag supplied: Bypassing trading hours and holiday guards.")
 
-    # 2. Read and Validate Environment Variables
-    app_id = os.environ.get("SETTRADE_APP_ID", "").strip()
-    app_secret = os.environ.get("SETTRADE_APP_SECRET", "").strip()
-    broker_id = os.environ.get("SETTRADE_BROKER_ID", "").strip()
-    app_code = os.environ.get("SETTRADE_APP_CODE", "ALGO").strip() or "ALGO"
-    is_sandbox_raw = os.environ.get("SETTRADE_IS_SANDBOX", "false").strip().lower()
-    is_sandbox = is_sandbox_raw in ("true", "1", "yes")
-
-    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
-
+    # 2. Validate Settrade & Turso Credentials for Data Collection
     missing_env: List[str] = []
     if not app_id: missing_env.append("SETTRADE_APP_ID")
     if not app_secret: missing_env.append("SETTRADE_APP_SECRET")
@@ -783,6 +1281,13 @@ def main() -> None:
     logger.info(f"Executing batch write to Turso Cloud SQLite ({total_records} rows)...")
     payload = build_turso_pipeline_payload(spot_snapshots, futures_snapshots, options_snapshots)
     execute_turso_pipeline(turso_pipeline_url, turso_token, payload)
+
+    # 8. Check and trigger intraday Telegram checkpoints (MORNING_OPEN / AFTERNOON_OPEN)
+    if telegram_bot_token and telegram_chat_id:
+        check_and_send_checkpoints(
+            now_bkk, turso_pipeline_url, turso_token,
+            telegram_bot_token, telegram_chat_id, force_notify=False
+        )
 
     total_elapsed = pytime.perf_counter() - start_time_perf
     logger.info(f"Collector job completed successfully in {total_elapsed:.2f} seconds.")
