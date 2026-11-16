@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Stateless TFEX Market Data Collector (1-Minute Snapshot)
+TFEX Market Data Collector & Persistent Session Worker
 Fetches SET50 Spot Index, S50 Futures, and SET50 Options from Settrade Open API (v2)
 and writes batch snapshots into Turso Cloud SQLite via HTTP Pipeline API (/v2/pipeline).
 
-Optimized for high-throughput Market Data (up to 60 req/s) with connection pooling,
-paced concurrency to prevent 429 bursts, and full board strike scanning.
+Supports:
+- Persistent Session Worker Loop (--session): Runs continuous 1-minute collection
+  during morning (09:45-12:35) and afternoon (14:15-17:05) sessions.
+- Single Snapshot (--once): Captures 1 minute snapshot and exits.
+- Telegram Checkpoint Inspection (--notify): Sends manual status report to Telegram.
 """
 
 import os
@@ -15,7 +18,7 @@ import argparse
 import calendar
 import logging
 import threading
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -98,11 +101,28 @@ SET_HOLIDAYS = {
     "2027-12-31",  # New Year's Eve
 }
 
+# Session schedule definitions (Asia/Bangkok)
+SESSION_CONFIG = {
+    "MORNING": {
+        "name": "MORNING",
+        "wakeup_start": time(9, 0),
+        "market_open": time(9, 45),
+        "verify_holiday": time(9, 55),
+        "session_end": time(12, 35),
+    },
+    "AFTERNOON": {
+        "name": "AFTERNOON",
+        "wakeup_start": time(13, 0),
+        "market_open": time(14, 15),
+        "verify_holiday": time(14, 25),
+        "session_end": time(17, 5),
+    }
+}
+
 # ==============================================================================
 # Performance & High-Throughput Connection Optimization (60 req/sec Market Data)
 # ==============================================================================
 # 1. Update settrade_v2 default RateLimit to Settrade Market Data specs (60 req/sec)
-#    and remove the restrictive 60 req/min order-placement throttle.
 _orig_ratelimit_init = RateLimit.__init__
 def _market_data_ratelimit_init(self, *args, **kwargs):
     _orig_ratelimit_init(self, *args, **kwargs)
@@ -149,30 +169,44 @@ class PacedRateLimiter:
 
 
 # ==============================================================================
-# 1. Trading Hours Guard
+# 1. Trading Hours & Session Detection
 # ==============================================================================
+def detect_session_window(now_bkk: datetime) -> Optional[Dict[str, Any]]:
+    """
+    Identifies if current Asia/Bangkok time falls into MORNING or AFTERNOON worker window.
+    - MORNING: 09:00 - 12:35 (Wakeup ~09:15, Open 09:45, Close 12:35)
+    - AFTERNOON: 13:00 - 17:05 (Wakeup ~13:45, Open 14:15, Close 17:05)
+    """
+    curr_t = now_bkk.time()
+    if time(9, 0) <= curr_t <= time(12, 35):
+        return SESSION_CONFIG["MORNING"]
+    if time(13, 0) <= curr_t <= time(17, 5):
+        return SESSION_CONFIG["AFTERNOON"]
+    return None
+
+
 def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
     """
     Checks if current Asia/Bangkok time is within official TFEX trading sessions:
     - Monday to Friday only
-    - Morning Session:   09:45 - 12:30
-    - Afternoon Session: 14:15 - 16:55
+    - Morning Session:   09:45 - 12:35
+    - Afternoon Session: 14:15 - 17:05
     """
-    weekday = dt.weekday()  # Monday is 0, Sunday is 6
+    weekday = dt.weekday()
     if weekday > 4:
         day_name = dt.strftime("%A")
         return False, f"Weekend ({day_name})"
 
     current_time = dt.time()
     morning_open = time(9, 45)
-    morning_close = time(12, 30)
+    morning_close = time(12, 35)
     afternoon_open = time(14, 15)
-    afternoon_close = time(16, 55)
+    afternoon_close = time(17, 5)
 
     if morning_open <= current_time <= morning_close:
-        return True, "Morning Session (09:45 - 12:30)"
+        return True, "Morning Session (09:45 - 12:35)"
     if afternoon_open <= current_time <= afternoon_close:
-        return True, "Afternoon Session (14:15 - 16:55)"
+        return True, "Afternoon Session (14:15 - 17:05)"
 
     return False, f"Outside sessions (Current time: {dt.strftime('%H:%M:%S')})"
 
@@ -202,9 +236,8 @@ def get_contract_last_trading_day(year: int, month: int) -> datetime:
 def resolve_active_series_candidates(now_bkk: datetime) -> Tuple[List[str], str, str]:
     """
     Automatically discovers candidate active quarterly contract months (H, M, U, Z) without hardcoding.
-    Both S50 Futures and SET50 Options strictly trade quarterly contracts.
     Returns:
-    - candidate_futures_series: List of the 4 active quarterly futures series (e.g. ['Z26', 'H27', 'M27', 'U27'])
+    - candidate_futures_series: List of 4 active quarterly futures series (e.g. ['Z26', 'H27', 'M27', 'U27'])
     - front_options_series: Nearest active quarterly options series (e.g. 'Z26')
     - next_options_series: Following active quarterly options series (e.g. 'H27')
     """
@@ -217,10 +250,7 @@ def resolve_active_series_candidates(now_bkk: datetime) -> Tuple[List[str], str,
                 yr_short = str(yr)[-2:]
                 active_quarterlies.append(f"{code}{yr_short}")
 
-    # Futures: The 4 actively traded quarterly contracts on TFEX (H, M, U, Z)
     candidate_futures_series = active_quarterlies[:4]
-
-    # Options: Front Series and Next Series (Quarterly only)
     front_opt_series = active_quarterlies[0]
     next_opt_series = active_quarterlies[1]
 
@@ -239,7 +269,6 @@ def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
         min_strike = min(min_strike, int(atm_strike - 250))
         max_strike = max(max_strike, int(atm_strike + 250))
 
-    # Align to 10-point step
     min_strike = int(min_strike // 10 * 10)
     max_strike = int(max_strike // 10 * 10)
     return list(range(min_strike, max_strike + 10, 10))
@@ -275,7 +304,6 @@ def extract_derivatives_data(raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
     vol = raw.get("total_volume") or raw.get("totalVolume") or raw.get("volume")
     oi = raw.get("open_interest") or raw.get("openInterest") or raw.get("oi") or raw.get("prior_oi")
 
-    # Fallback to order book lists if present
     if bid is None and "bids" in raw and isinstance(raw["bids"], list) and raw["bids"]:
         bid = raw["bids"][0].get("price")
     if ask is None and "asks" in raw and isinstance(raw["asks"], list) and raw["asks"]:
@@ -323,13 +351,8 @@ def build_turso_pipeline_payload(
     futures_rows: List[Dict[str, Any]],
     options_rows: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """
-    Constructs an atomic batch payload for Turso /v2/pipeline.
-    Creates tables if not exists and inserts all collected rows.
-    """
     requests_list: List[Dict[str, Any]] = []
 
-    # 1. DDL Statements
     ddl_spot = """
     CREATE TABLE IF NOT EXISTS spot_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,7 +404,6 @@ def build_turso_pipeline_payload(
             "stmt": {"sql": ddl.strip()}
         })
 
-    # 2. Insert spot snapshot
     insert_spot_sql = """
     INSERT INTO spot_snapshots (captured_at_bkk, symbol, last, volume, value)
     VALUES (?, ?, ?, ?, ?);
@@ -399,7 +421,6 @@ def build_turso_pipeline_payload(
             "stmt": {"sql": insert_spot_sql.strip(), "args": args}
         })
 
-    # 3. Insert futures snapshots
     insert_futures_sql = """
     INSERT INTO futures_snapshots (captured_at_bkk, symbol, bid, ask, last, volume, open_interest)
     VALUES (?, ?, ?, ?, ?, ?, ?);
@@ -419,7 +440,6 @@ def build_turso_pipeline_payload(
             "stmt": {"sql": insert_futures_sql.strip(), "args": args}
         })
 
-    # 4. Insert options snapshots
     insert_options_sql = """
     INSERT INTO options_snapshots (
         captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest
@@ -443,7 +463,6 @@ def build_turso_pipeline_payload(
             "stmt": {"sql": insert_options_sql.strip(), "args": args}
         })
 
-    # Close pipeline transaction
     requests_list.append({"type": "close"})
     return {"requests": requests_list}
 
@@ -458,13 +477,12 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
         response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=30)
     except requests.exceptions.RequestException as e:
         logger.error(f"Turso network connection failed: {e}")
-        sys.exit(1)
+        raise
 
     if response.status_code != 200:
-        # Sanitize error to prevent token leakage
         sanitized_msg = response.text.replace(auth_token, "***")
         logger.error(f"Turso API returned HTTP status {response.status_code}: {sanitized_msg}")
-        sys.exit(1)
+        raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized_msg}")
 
     data = response.json()
     results = data.get("results", [])
@@ -475,7 +493,7 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
     ]
     if errors:
         logger.error(f"Turso pipeline reported {len(errors)} SQL statement error(s): {errors[:3]}")
-        sys.exit(1)
+        raise RuntimeError(f"Turso SQL execution error: {errors[0]}")
 
     logger.info("Turso HTTP pipeline batch write committed successfully.")
 
@@ -641,7 +659,7 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
         # 5. morning bars
         f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:35:00';",
         # 6. afternoon bars
-        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 17:00:00';",
+        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 17:05:00';",
         # 7. pragma page_count
         "PRAGMA page_count;",
         # 8. pragma page_size
@@ -652,7 +670,6 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
     reqs.append({"type": "close"})
 
     results = query_turso_pipeline(pipeline_url, auth_token, reqs)
-
     stats: Dict[str, Any] = {}
 
     def get_first_row(idx: int) -> Dict[str, Any]:
@@ -721,17 +738,20 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
 
 
 def get_current_checkpoint(t: time) -> Optional[str]:
-    # Checkpoint 1: 10:00 - 10:30 (Morning Open)
+    """
+    4-Checkpoint alert schedules:
+    1. MORNING_OPEN: 10:00 (10:00 - 10:30)
+    2. MIDDAY_CLOSE: 12:32 (12:32 - 13:00)
+    3. AFTERNOON_OPEN: 14:30 (14:30 - 15:00)
+    4. EVENING_CLOSE: 17:02 (17:02 - 17:30)
+    """
     if time(10, 0) <= t <= time(10, 30):
         return "MORNING_OPEN"
-    # Checkpoint 2: 12:30 - 13:00 (Midday Break)
-    if time(12, 30) <= t <= time(13, 0):
+    if time(12, 32) <= t <= time(13, 0):
         return "MIDDAY_CLOSE"
-    # Checkpoint 3: 14:30 - 15:00 (Afternoon Open)
     if time(14, 30) <= t <= time(15, 0):
         return "AFTERNOON_OPEN"
-    # Checkpoint 4: 17:00 - 17:30 (Evening Close)
-    if time(17, 0) <= t <= time(17, 30):
+    if time(17, 2) <= t <= time(17, 30):
         return "EVENING_CLOSE"
     return None
 
@@ -787,7 +807,7 @@ def build_checkpoint_message(
     if checkpoint == "MORNING_OPEN":
         body = (
             f"🔔 <b>TFEX INTRADAY: MORNING OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:30)\n"
+            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:35)\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
             f"• <b>Bars Captured (Today):</b> <b>{spot_count}</b> bars\n"
@@ -814,7 +834,7 @@ def build_checkpoint_message(
         warn = "\n⚠️ <b>Alert:</b> No bars captured yet for afternoon session!" if afternoon_bars == 0 else ""
         body = (
             f"📈 <b>TFEX INTRADAY: AFTERNOON OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 16:55)\n"
+            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 17:05)\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Afternoon Bars (since 14:15):</b> <b>{afternoon_bars}</b> bars\n"
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
@@ -839,8 +859,8 @@ def build_checkpoint_message(
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Trading Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
             f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 325 ({c_pct:.1f}%)\n"
-            f"  - Morning (09:45-12:30): {morning_bars} bars\n"
-            f"  - Afternoon (14:15-16:55): {afternoon_bars} bars\n"
+            f"  - Morning (09:45-12:35): {morning_bars} bars\n"
+            f"  - Afternoon (14:15-17:05): {afternoon_bars} bars\n"
             f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
             f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
             f"• <b>Database Storage:</b> <b>{db_size}</b> ({db_pages} pages)\n"
@@ -940,7 +960,60 @@ def check_and_send_checkpoints(
 
 
 # ==============================================================================
-# 6. Worker Task for Option Quote Fetching
+# 6. Settrade Client Manager & Re-authentication
+# ==============================================================================
+class SettradeClientManager:
+    """
+    Manages Settrade Open API connection state, proactive re-authentication,
+    and automatic recovery upon token expiration during long-running sessions.
+    """
+    def __init__(self, app_id: str, app_secret: str, broker_id: str, app_code: str, is_sandbox: bool):
+        self.app_id = app_id
+        self.app_secret = app_secret
+        self.broker_id = broker_id
+        self.app_code = app_code
+        self.is_sandbox = is_sandbox
+        self.investor: Optional[Investor] = None
+        self.market_data: Any = None
+        self.last_auth_time: float = 0.0
+
+    def connect(self) -> None:
+        broker = self.broker_id
+        if self.is_sandbox:
+            config["environment"] = "uat"
+            if not broker or broker.upper() == "SANDBOX":
+                broker = Investor.SANDBOX
+
+        logger.info(f"[SETTRADE] Authenticating Open API (broker: {broker}, sandbox: {self.is_sandbox})...")
+        try:
+            self.investor = Investor(
+                app_id=self.app_id,
+                app_secret=self.app_secret,
+                broker_id=broker,
+                app_code=self.app_code,
+                is_auto_queue=False
+            )
+            self.market_data = self.investor.MarketData()
+            self.last_auth_time = pytime.time()
+            logger.info("[SETTRADE] Open API authentication successful.")
+        except Exception as e:
+            logger.error(f"[SETTRADE] Authentication failed: {e}")
+            raise RuntimeError(f"Settrade authentication failure: {e}") from e
+
+    def ensure_authenticated(self, max_age_seconds: float = 7200.0) -> None:
+        """Proactively re-authenticates if token age exceeds max_age_seconds (default 2 hours)."""
+        if self.investor is None or (pytime.time() - self.last_auth_time) > max_age_seconds:
+            logger.info("[SETTRADE] Token age threshold reached or uninitialized. Re-authenticating...")
+            self.connect()
+
+    def handle_auth_failure(self) -> None:
+        """Forced re-authentication on auth-related exceptions."""
+        logger.warning("[SETTRADE] Authentication error encountered. Re-authenticating immediately...")
+        self.connect()
+
+
+# ==============================================================================
+# 7. Worker Task for Option Quote Fetching
 # ==============================================================================
 def fetch_option_quote_task(
     market_data: Any,
@@ -971,7 +1044,6 @@ def fetch_option_quote_task(
                 "open_interest": fields["open_interest"]
             }
     except SettradeError:
-        # Strike not active / not listed on TFEX board
         return None
     except Exception as e:
         logger.debug(f"Option fetch error for {symbol}: {e}")
@@ -979,197 +1051,34 @@ def fetch_option_quote_task(
     return None
 
 
-def load_dotenv_simple(env_path: str = ".env") -> None:
-    """Loads environment variables from .env file if present (without external dependencies)."""
-    if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        key = key.strip()
-                        val = val.strip().strip("\"'")
-                        if key and key not in os.environ:
-                            os.environ[key] = val
-            logger.info("Loaded environment variables from local .env file.")
-        except Exception as e:
-            logger.warning(f"Could not read .env file: {e}")
-
-
-# ==============================================================================
-# 6. Main Execution Workflow
-# ==============================================================================
-def main() -> None:
-    start_time_perf = pytime.perf_counter()
-
-    parser = argparse.ArgumentParser(description="TFEX 1-Minute Stateless Market Data Collector")
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Bypass trading hours guard and force execution immediately."
-    )
-    parser.add_argument(
-        "--notify",
-        action="store_true",
-        help="Manually trigger and send the latest intraday status report to Telegram."
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Concurrency workers for Market Data queries (default: 8)."
-    )
-    parser.add_argument(
-        "--max-rps",
-        type=float,
-        default=45.0,
-        help="Maximum requests per second to avoid 429 gateway burst (default: 45.0)."
-    )
-    args = parser.parse_args()
-
-    # Automatically load local .env if present
-    load_dotenv_simple(".env")
-
-    now_bkk = datetime.now(BANGKOK_TZ)
-    timestamp_bkk_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"Collector initiated at {timestamp_bkk_str} (Asia/Bangkok)")
-
-    # Read and Validate Environment Variables
-    app_id = os.environ.get("SETTRADE_APP_ID", "").strip()
-    app_secret = os.environ.get("SETTRADE_APP_SECRET", "").strip()
-    broker_id = os.environ.get("SETTRADE_BROKER_ID", "").strip()
-    app_code = os.environ.get("SETTRADE_APP_CODE", "ALGO").strip() or "ALGO"
-    is_sandbox_raw = os.environ.get("SETTRADE_IS_SANDBOX", "false").strip().lower()
-    is_sandbox = is_sandbox_raw in ("true", "1", "yes")
-
-    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
-    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-
-    # Handle manual Telegram notification trigger (--notify)
-    if args.notify:
-        if not turso_url or not turso_token:
-            logger.error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN for --notify mode.")
-            sys.exit(1)
-        turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
-        logger.info("[NOTIFY] Executing manual Telegram status report...")
-        success = check_and_send_checkpoints(
-            now_bkk, turso_pipeline_url, turso_token,
-            telegram_bot_token, telegram_chat_id, force_notify=True
-        )
-        sys.exit(0 if success else 1)
-
-    # 1. Trading Hours & Calendar Holiday Guard
-    if not args.force:
-        # 1.1 Check Static Exchange Holidays (SET/TFEX Official Holidays)
-        today_str = now_bkk.strftime("%Y-%m-%d")
-        if today_str in SET_HOLIDAYS:
-            logger.info(
-                f"[GUARD] Today ({today_str}) is an official SET/TFEX exchange holiday. "
-                f"Terminating gracefully (sys.exit(0)). Use --force to override."
-            )
-            sys.exit(0)
-
-        # 1.2 Check Session Trading Hours
-        within_hours, session_desc = is_within_trading_hours(now_bkk)
-        if not within_hours:
-            # Check if current time falls within off-market checkpoint windows (MIDDAY_CLOSE or EVENING_CLOSE)
-            curr_chk = get_current_checkpoint(now_bkk.time())
-            if curr_chk in ("MIDDAY_CLOSE", "EVENING_CLOSE") and turso_url and turso_token and telegram_bot_token:
-                turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
-                logger.info(f"[CHECKPOINT] Current time is within {curr_chk} window. Running checkpoint alert evaluation...")
-                check_and_send_checkpoints(
-                    now_bkk, turso_pipeline_url, turso_token,
-                    telegram_bot_token, telegram_chat_id, force_notify=False
-                )
-
-            logger.info(
-                f"[GUARD] Current time {now_bkk.strftime('%A %H:%M:%S')} is outside TFEX trading sessions "
-                f"({session_desc}). Terminating gracefully. Use --force to override."
-            )
-            sys.exit(0)
-        logger.info(f"[GUARD] Trading hours verified: {session_desc}")
-    else:
-        logger.info("[GUARD] --force flag supplied: Bypassing trading hours and holiday guards.")
-
-    # 2. Validate Settrade & Turso Credentials for Data Collection
-    missing_env: List[str] = []
-    if not app_id: missing_env.append("SETTRADE_APP_ID")
-    if not app_secret: missing_env.append("SETTRADE_APP_SECRET")
-    if not broker_id: missing_env.append("SETTRADE_BROKER_ID")
-    if not turso_url: missing_env.append("TURSO_DATABASE_URL")
-    if not turso_token: missing_env.append("TURSO_AUTH_TOKEN")
-
-    if missing_env:
-        logger.error(f"Missing required environment variables: {', '.join(missing_env)}")
-        sys.exit(1)
-
-    turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
-
-    # 3. Initialize Settrade Open API Client
-    try:
-        if is_sandbox:
-            config["environment"] = "uat"
-            if not broker_id or broker_id.upper() == "SANDBOX":
-                broker_id = Investor.SANDBOX
-
-        logger.info(f"Connecting to Settrade Open API (broker: {broker_id}, sandbox: {is_sandbox})...")
-        investor = Investor(
-            app_id=app_id,
-            app_secret=app_secret,
-            broker_id=broker_id,
-            app_code=app_code,
-            is_auto_queue=False  # Direct high-throughput execution
-        )
-        market_data = investor.MarketData()
-        logger.info("Settrade Open API authentication successful.")
-    except Exception as e:
-        logger.error(f"Failed to authenticate with Settrade Open API: {e}")
-        sys.exit(1)
-
-    # Resolve active series candidates (Rollover proof: Quarterly Options & Rolling Futures)
-    futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
-
-    # 3.1 Ad-hoc / Emergency Holiday Guard (Check latest 1m candle of Front Futures after 09:46)
-    if not args.force and now_bkk.time() >= time(9, 46):
-        front_fut_symbol = f"S50{front_opt_series}"
-        try:
-            logger.info(f"[GUARD] Verifying live market activity on {front_fut_symbol} (time {now_bkk.strftime('%H:%M:%S')} >= 09:46)...")
-            candles = market_data.get_candlestick(front_fut_symbol, interval="1m", limit=1)
-            if candles and "time" in candles and candles["time"]:
-                latest_candle_time = candles["time"][-1]
-                candle_dt = datetime.fromtimestamp(latest_candle_time, BANGKOK_TZ)
-                candle_date = candle_dt.date()
-                today_date = now_bkk.date()
-                if candle_date < today_date:
-                    logger.info(
-                        f"[GUARD] Ad-hoc / Emergency Holiday Detected: Latest 1m candle date for Front Futures {front_fut_symbol} "
-                        f"is {candle_date} (< {today_date}). Market is closed today. Terminating gracefully (sys.exit(0))."
-                    )
-                    sys.exit(0)
-                logger.info(
-                    f"[GUARD] Live market verified: Latest 1m candle for {front_fut_symbol} is from today "
-                    f"({candle_dt.strftime('%Y-%m-%d %H:%M')}). Market is ACTIVE."
-                )
-        except Exception as e:
-            logger.warning(f"Could not verify market open status via {front_fut_symbol}: {e}")
-
+def collect_and_save_snapshot(
+    market_data: Any,
+    turso_pipeline_url: str,
+    turso_token: str,
+    workers: int,
+    max_rps: float,
+    timestamp_bkk_str: str,
+    now_bkk: datetime,
+    front_opt_series: str,
+    next_opt_series: str,
+    futures_candidates: List[str]
+) -> Tuple[int, int, int]:
+    """
+    Performs atomic 1-minute market snapshot collection (Spot, Futures, Options)
+    and commits to Turso Cloud SQLite.
+    Returns: (spot_count, futures_count, options_count)
+    """
     spot_snapshots: List[Dict[str, Any]] = []
     futures_snapshots: List[Dict[str, Any]] = []
     options_snapshots: List[Dict[str, Any]] = []
 
-    # 4. Fetch SET50 Spot Index (with candlestick fallback for index symbols)
+    # 1. Fetch SET50 Spot Index
     spot_price_ref: Optional[float] = None
     try:
         try:
             spot_res = market_data.get_quote_symbol("SET50")
             spot_fields = extract_spot_data(spot_res)
         except Exception:
-            # Index candlestick fallback for SET50 spot index
             candles = market_data.get_candlestick("SET50", interval="1m", limit=1)
             spot_fields = {
                 "last": float(candles["close"][-1]) if candles.get("close") else None,
@@ -1189,9 +1098,7 @@ def main() -> None:
     except Exception as e:
         logger.warning(f"Failed to fetch SET50 Spot: {e}")
 
-    # 5. Discover and Fetch Active S50 Futures
-    logger.info(f"Evaluating candidate futures series: {futures_candidates}")
-
+    # 2. Discover and Fetch Active S50 Futures
     front_futures_price: Optional[float] = None
     for series_tag in futures_candidates:
         symbol = f"S50{series_tag}"
@@ -1215,20 +1122,14 @@ def main() -> None:
                 if front_futures_price is None and fields["last"] is not None:
                     front_futures_price = fields["last"]
         except SettradeError:
-            # Series not yet listed or already expired
             logger.debug(f"Candidate futures symbol {symbol} is not active in market.")
         except Exception as e:
             logger.warning(f"Error querying futures symbol {symbol}: {e}")
 
-    # 6. Fetch SET50 Options for All Active Strikes (Front & Next Series)
+    # 3. Fetch SET50 Options for All Active Strikes (Front & Next Series)
     atm_base = spot_price_ref or front_futures_price or 900.0
     all_strikes = generate_all_active_strikes(atm_base)
-    logger.info(
-        f"Scanning SET50 Options across {len(all_strikes)} strikes "
-        f"({all_strikes[0]} - {all_strikes[-1]}) for Front={front_opt_series} and Next={next_opt_series}..."
-    )
 
-    # Build full list of option targets to query
     option_targets: List[Tuple[str, str, float, str]] = []
     for opt_series in [front_opt_series, next_opt_series]:
         for strike in all_strikes:
@@ -1236,12 +1137,8 @@ def main() -> None:
                 symbol = f"S50{opt_series}{opt_type}{strike}"
                 option_targets.append((symbol, opt_series, float(strike), opt_type))
 
-    logger.info(f"Dispatching {len(option_targets)} Option queries (Workers={args.workers}, Pacing={args.max_rps:.0f} req/s)...")
-    options_start = pytime.perf_counter()
-
-    pacer = PacedRateLimiter(max_rps=args.max_rps)
-
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+    pacer = PacedRateLimiter(max_rps=max_rps)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         futures_tasks = [
             executor.submit(
                 fetch_option_quote_task,
@@ -1261,36 +1158,456 @@ def main() -> None:
             if result is not None:
                 options_snapshots.append(result)
 
-    options_duration = pytime.perf_counter() - options_start
-    logger.info(
-        f"Options scan finished in {options_duration:.2f}s: "
-        f"Found {len(options_snapshots)} active contracts out of {len(option_targets)} scanned."
-    )
-
-    logger.info(
-        f"Collection summary: Spot={len(spot_snapshots)}, "
-        f"Futures={len(futures_snapshots)}, Options={len(options_snapshots)}"
-    )
-
     total_records = len(spot_snapshots) + len(futures_snapshots) + len(options_snapshots)
-    if total_records == 0:
-        logger.warning("No records collected during this run. Skipping Turso write.")
-        sys.exit(0)
+    logger.info(
+        f"Snapshot summary at {timestamp_bkk_str}: Spot={len(spot_snapshots)}, "
+        f"Futures={len(futures_snapshots)}, Options={len(options_snapshots)} (Total={total_records})"
+    )
 
-    # 7. Write to Turso via HTTP Pipeline (Batch in single HTTP request)
-    logger.info(f"Executing batch write to Turso Cloud SQLite ({total_records} rows)...")
+    if total_records == 0:
+        logger.warning(f"No records collected during tick at {timestamp_bkk_str}. Skipping Turso write.")
+        return 0, 0, 0
+
+    # 4. Write to Turso via HTTP Pipeline
     payload = build_turso_pipeline_payload(spot_snapshots, futures_snapshots, options_snapshots)
     execute_turso_pipeline(turso_pipeline_url, turso_token, payload)
 
-    # 8. Check and trigger intraday Telegram checkpoints (MORNING_OPEN / AFTERNOON_OPEN)
+    return len(spot_snapshots), len(futures_snapshots), len(options_snapshots)
+
+
+# ==============================================================================
+# 8. Pre-Market Standby & Holiday Early Exit Guards
+# ==============================================================================
+def wait_for_market_open(target_open_time: time, session_name: str) -> None:
+    """
+    If script is awakened before session market open (e.g. 09:15 or 13:45),
+    logs standby status and sleeps precisely until target_open_time (:00 seconds).
+    """
+    now_bkk = datetime.now(BANGKOK_TZ)
+    target_dt = now_bkk.replace(
+        hour=target_open_time.hour,
+        minute=target_open_time.minute,
+        second=0,
+        microsecond=0
+    )
+    if target_dt <= now_bkk:
+        return
+
+    total_wait_sec = (target_dt - now_bkk).total_seconds()
+    logger.info(
+        f"[SESSION] {session_name} worker awakened in pre-market standby window at {now_bkk.strftime('%H:%M:%S')}. "
+        f"Waiting until market open at {target_open_time.strftime('%H:%M:%S')} ({total_wait_sec:.0f}s)..."
+    )
+
+    while True:
+        current_bkk = datetime.now(BANGKOK_TZ)
+        rem = (target_dt - current_bkk).total_seconds()
+        if rem <= 0.05:
+            break
+        if rem > 60:
+            mins_left = int(rem // 60)
+            secs_left = int(rem % 60)
+            logger.info(f"[PRE-MARKET] Standby for {session_name} open ({target_open_time.strftime('%H:%M:%S')})... {mins_left}m {secs_left}s remaining")
+            pytime.sleep(min(rem - 1.0, 60.0))
+        else:
+            pytime.sleep(rem)
+            break
+
+    logger.info(f"[SESSION] Market open time reached ({datetime.now(BANGKOK_TZ).strftime('%H:%M:%S')}). Commencing 1-minute collection loop.")
+
+
+def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: datetime) -> None:
+    """
+    10 minutes past market open (09:55 or 14:25), checks whether today's trading
+    activity has started on Front Futures or SET50. If no today candles exist, exits gracefully (sys.exit(0)).
+    """
+    front_fut_symbol = f"S50{front_opt_series}"
+    logger.info(f"[GUARD] Verifying live market activity on {front_fut_symbol} (10 min past market open)...")
+    try:
+        candles = market_data.get_candlestick(front_fut_symbol, interval="1m", limit=1)
+        today_date = now_bkk.date()
+        if candles and "time" in candles and candles["time"]:
+            latest_ts = candles["time"][-1]
+            candle_dt = datetime.fromtimestamp(latest_ts, BANGKOK_TZ)
+            if candle_dt.date() < today_date:
+                # Cross-check SET50 spot index
+                spot_has_today = False
+                try:
+                    spot_candles = market_data.get_candlestick("SET50", interval="1m", limit=1)
+                    if spot_candles and "time" in spot_candles and spot_candles["time"]:
+                        s_dt = datetime.fromtimestamp(spot_candles["time"][-1], BANGKOK_TZ)
+                        if s_dt.date() == today_date:
+                            spot_has_today = True
+                except Exception:
+                    pass
+
+                if not spot_has_today:
+                    logger.info(
+                        f"[GUARD] Holiday / Inactive Market Detected: 10 minutes past market open ({now_bkk.strftime('%H:%M:%S')}). "
+                        f"Latest candlestick date for {front_fut_symbol} is {candle_dt.date()} (< {today_date}). "
+                        f"No market trades recorded today. Exiting session worker gracefully (sys.exit(0))."
+                    )
+                    sys.exit(0)
+
+            logger.info(
+                f"[GUARD] Live market verified: Latest 1m candle for {front_fut_symbol} is "
+                f"{candle_dt.strftime('%Y-%m-%d %H:%M')}. Market is ACTIVE."
+            )
+    except Exception as e:
+        logger.warning(f"[GUARD] Could not verify market activity via {front_fut_symbol}: {e}")
+
+
+# ==============================================================================
+# 9. Execution Modes: Session Worker Loop, Single Snapshot, Manual Notify
+# ==============================================================================
+def run_session_worker(
+    settrade_mgr: SettradeClientManager,
+    turso_pipeline_url: str,
+    turso_token: str,
+    telegram_bot_token: str,
+    telegram_chat_id: str,
+    workers: int,
+    max_rps: float,
+    force: bool = False
+) -> None:
+    now_bkk = datetime.now(BANGKOK_TZ)
+    today_str = now_bkk.strftime("%Y-%m-%d")
+
+    # 1. Calendar Holiday & Weekend Checks
+    if not force:
+        if now_bkk.weekday() > 4:
+            logger.info(f"[GUARD] Weekend ({now_bkk.strftime('%A')}). Exiting gracefully (sys.exit(0)).")
+            sys.exit(0)
+        if today_str in SET_HOLIDAYS:
+            logger.info(f"[GUARD] Today ({today_str}) is an official SET/TFEX exchange holiday. Exiting gracefully (sys.exit(0)).")
+            sys.exit(0)
+
+    # 2. Detect Session Window
+    session_cfg = detect_session_window(now_bkk)
+    if not session_cfg and not force:
+        logger.info(
+            f"[GUARD] Current time {now_bkk.strftime('%H:%M:%S')} is outside active session windows "
+            f"(Morning: 09:00 - 12:35, Afternoon: 13:00 - 17:05). Exiting gracefully (sys.exit(0))."
+        )
+        sys.exit(0)
+
+    if session_cfg:
+        session_name = session_cfg["name"]
+        market_open_time = session_cfg["market_open"]
+        verify_holiday_time = session_cfg["verify_holiday"]
+        session_end_time = session_cfg["session_end"]
+    else:
+        # Force mode outside scheduled session windows
+        session_name = "FORCED_AD_HOC"
+        market_open_time = now_bkk.time()
+        verify_holiday_time = time(23, 59, 59)
+        session_end_time = (now_bkk + timedelta(minutes=10)).time()
+        logger.info(f"[SESSION] Running forced ad-hoc session until {session_end_time.strftime('%H:%M:%S')}")
+
+    logger.info(f"=== Starting TFEX Persistent Session Worker: {session_name} ===")
+    logger.info(f"Market Open: {market_open_time.strftime('%H:%M:%S')} | Session End: {session_end_time.strftime('%H:%M:%S')}")
+
+    # 3. Connect to Settrade Open API
+    try:
+        settrade_mgr.connect()
+    except Exception as e:
+        logger.error(f"Cannot initialize Settrade Open API connection: {e}")
+        sys.exit(1)
+
+    # 4. Pre-Market Wait if awakened before open time
+    if not force and now_bkk.time() < market_open_time:
+        wait_for_market_open(market_open_time, session_name)
+
+    # 5. Resolve active contracts
+    now_bkk = datetime.now(BANGKOK_TZ)
+    futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
+    logger.info(f"[SESSION] Active Series: Front={front_opt_series}, Next={next_opt_series}, Futures={futures_candidates}")
+
+    market_verified = False
+    if not force and now_bkk.time() >= verify_holiday_time:
+        check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, now_bkk)
+        market_verified = True
+
+    total_collected_bars = 0
+
+    # 6. Session Worker Loop (1-minute drift-free exact loop)
+    while True:
+        loop_now = datetime.now(BANGKOK_TZ)
+
+        # Check graceful exit condition
+        if not force and loop_now.time() >= session_end_time:
+            logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
+            break
+
+        ts_str = loop_now.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"--- [TICK] Minute Bar Capture: {ts_str} (Session: {session_name}) ---")
+
+        # Proactive token re-auth check
+        try:
+            settrade_mgr.ensure_authenticated()
+        except Exception as e:
+            logger.warning(f"[SETTRADE] Proactive auth refresh warning: {e}")
+
+        # Capture snapshot & write to Turso (Fault tolerant)
+        try:
+            spot_c, fut_c, opt_c = collect_and_save_snapshot(
+                market_data=settrade_mgr.market_data,
+                turso_pipeline_url=turso_pipeline_url,
+                turso_token=turso_token,
+                workers=workers,
+                max_rps=max_rps,
+                timestamp_bkk_str=ts_str,
+                now_bkk=loop_now,
+                front_opt_series=front_opt_series,
+                next_opt_series=next_opt_series,
+                futures_candidates=futures_candidates
+            )
+            if spot_c > 0 or fut_c > 0 or opt_c > 0:
+                total_collected_bars += 1
+        except Exception as e:
+            logger.warning(f"[TICK ERROR] Data collection or Turso write failed at {ts_str}: {e}")
+            err_str = str(e).lower()
+            if "auth" in err_str or "token" in err_str or "unauthorized" in err_str or "401" in err_str:
+                try:
+                    settrade_mgr.handle_auth_failure()
+                except Exception as reauth_err:
+                    logger.error(f"[SETTRADE] Re-authentication failed: {reauth_err}")
+
+        # 10-minute Holiday / Inactive market check
+        if not market_verified and not force and datetime.now(BANGKOK_TZ).time() >= verify_holiday_time:
+            check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, datetime.now(BANGKOK_TZ))
+            market_verified = True
+
+        # Telegram 4-checkpoint alerts evaluation
+        if telegram_bot_token and telegram_chat_id:
+            try:
+                check_and_send_checkpoints(
+                    datetime.now(BANGKOK_TZ), turso_pipeline_url, turso_token,
+                    telegram_bot_token, telegram_chat_id, force_notify=False
+                )
+            except Exception as e:
+                logger.warning(f"[TELEGRAM] Checkpoint alert error: {e}")
+
+        # Check if session has ended right now after work
+        finish_now = datetime.now(BANGKOK_TZ)
+        if not force and finish_now.time() >= session_end_time:
+            logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
+            break
+
+        # Precise drift-free sleep until next :00 second
+        next_minute_target = (finish_now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        sleep_duration = (next_minute_target - datetime.now(BANGKOK_TZ)).total_seconds()
+        if sleep_duration > 0:
+            pytime.sleep(sleep_duration)
+
+    logger.info(
+        f"=== Session Worker Completed Successfully: {session_name} ===\n"
+        f"Total bars collected in session: {total_collected_bars} bars.\n"
+        f"Exit time: {datetime.now(BANGKOK_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    sys.exit(0)
+
+
+def run_single_snapshot(
+    settrade_mgr: SettradeClientManager,
+    turso_pipeline_url: str,
+    turso_token: str,
+    telegram_bot_token: str,
+    telegram_chat_id: str,
+    workers: int,
+    max_rps: float,
+    force: bool = False
+) -> None:
+    now_bkk = datetime.now(BANGKOK_TZ)
+    today_str = now_bkk.strftime("%Y-%m-%d")
+    ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+
+    if not force:
+        if today_str in SET_HOLIDAYS:
+            logger.info(f"[GUARD] Today ({today_str}) is an official SET/TFEX exchange holiday. Exiting (sys.exit(0)).")
+            sys.exit(0)
+        within_hours, session_desc = is_within_trading_hours(now_bkk)
+        if not within_hours:
+            logger.info(f"[GUARD] Current time is outside TFEX trading sessions ({session_desc}). Exiting (sys.exit(0)).")
+            sys.exit(0)
+
+    try:
+        settrade_mgr.connect()
+    except Exception as e:
+        logger.error(f"Cannot initialize Settrade Open API connection: {e}")
+        sys.exit(1)
+    futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
+
+    spot_c, fut_c, opt_c = collect_and_save_snapshot(
+        market_data=settrade_mgr.market_data,
+        turso_pipeline_url=turso_pipeline_url,
+        turso_token=turso_token,
+        workers=workers,
+        max_rps=max_rps,
+        timestamp_bkk_str=ts_str,
+        now_bkk=now_bkk,
+        front_opt_series=front_opt_series,
+        next_opt_series=next_opt_series,
+        futures_candidates=futures_candidates
+    )
+
     if telegram_bot_token and telegram_chat_id:
-        check_and_send_checkpoints(
-            now_bkk, turso_pipeline_url, turso_token,
-            telegram_bot_token, telegram_chat_id, force_notify=False
+        try:
+            check_and_send_checkpoints(
+                now_bkk, turso_pipeline_url, turso_token,
+                telegram_bot_token, telegram_chat_id, force_notify=False
+            )
+        except Exception as e:
+            logger.warning(f"[TELEGRAM] Checkpoint evaluation error: {e}")
+
+    logger.info(f"Single snapshot completed: Spot={spot_c}, Futures={fut_c}, Options={opt_c}")
+    sys.exit(0)
+
+
+def run_notify(
+    turso_pipeline_url: str,
+    turso_token: str,
+    telegram_bot_token: str,
+    telegram_chat_id: str
+) -> None:
+    now_bkk = datetime.now(BANGKOK_TZ)
+    logger.info("[NOTIFY] Executing manual Telegram status report...")
+    success = check_and_send_checkpoints(
+        now_bkk, turso_pipeline_url, turso_token,
+        telegram_bot_token, telegram_chat_id, force_notify=True
+    )
+    sys.exit(0 if success else 1)
+
+
+def load_dotenv_simple(env_path: str = ".env") -> None:
+    """Loads environment variables from .env file if present."""
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip().strip("\"'")
+                        if key and key not in os.environ:
+                            os.environ[key] = val
+            logger.info("Loaded environment variables from local .env file.")
+        except Exception as e:
+            logger.warning(f"Could not read .env file: {e}")
+
+
+# ==============================================================================
+# 10. CLI Parser & Main Entrypoint
+# ==============================================================================
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="TFEX Persistent Session Worker & Market Data Collector"
+    )
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        help="Run persistent 1-minute session worker loop until session closes (Morning: 09:45-12:35, Afternoon: 14:15-17:05)."
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single collection snapshot and exit."
+    )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Manually trigger and send the latest intraday status report to Telegram."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass trading hours and holiday guards."
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrency workers for Market Data queries (default: 8)."
+    )
+    parser.add_argument(
+        "--max-rps",
+        type=float,
+        default=45.0,
+        help="Maximum requests per second to avoid 429 gateway burst (default: 45.0)."
+    )
+    args = parser.parse_args()
+
+    load_dotenv_simple(".env")
+
+    # Read environment variables
+    app_id = os.environ.get("SETTRADE_APP_ID", "").strip()
+    app_secret = os.environ.get("SETTRADE_APP_SECRET", "").strip()
+    broker_id = os.environ.get("SETTRADE_BROKER_ID", "").strip()
+    app_code = os.environ.get("SETTRADE_APP_CODE", "ALGO").strip() or "ALGO"
+    is_sandbox_raw = os.environ.get("SETTRADE_IS_SANDBOX", "false").strip().lower()
+    is_sandbox = is_sandbox_raw in ("true", "1", "yes")
+
+    turso_url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
+    telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    # Mode: --notify
+    if args.notify:
+        if not turso_url or not turso_token:
+            logger.error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN for --notify mode.")
+            sys.exit(1)
+        turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
+        run_notify(turso_pipeline_url, turso_token, telegram_bot_token, telegram_chat_id)
+
+    # Validate Settrade & Turso credentials for collection modes
+    missing_env: List[str] = []
+    if not app_id: missing_env.append("SETTRADE_APP_ID")
+    if not app_secret: missing_env.append("SETTRADE_APP_SECRET")
+    if not broker_id: missing_env.append("SETTRADE_BROKER_ID")
+    if not turso_url: missing_env.append("TURSO_DATABASE_URL")
+    if not turso_token: missing_env.append("TURSO_AUTH_TOKEN")
+
+    if missing_env:
+        logger.error(f"Missing required environment variables: {', '.join(missing_env)}")
+        sys.exit(1)
+
+    turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
+    settrade_mgr = SettradeClientManager(
+        app_id=app_id,
+        app_secret=app_secret,
+        broker_id=broker_id,
+        app_code=app_code,
+        is_sandbox=is_sandbox
+    )
+
+    # Mode: --once
+    if args.once:
+        run_single_snapshot(
+            settrade_mgr=settrade_mgr,
+            turso_pipeline_url=turso_pipeline_url,
+            turso_token=turso_token,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+            workers=args.workers,
+            max_rps=args.max_rps,
+            force=args.force
         )
 
-    total_elapsed = pytime.perf_counter() - start_time_perf
-    logger.info(f"Collector job completed successfully in {total_elapsed:.2f} seconds.")
+    # Default / Mode: --session
+    run_session_worker(
+        settrade_mgr=settrade_mgr,
+        turso_pipeline_url=turso_pipeline_url,
+        turso_token=turso_token,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        workers=args.workers,
+        max_rps=args.max_rps,
+        force=args.force
+    )
 
 
 if __name__ == "__main__":

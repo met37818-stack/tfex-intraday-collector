@@ -1,6 +1,6 @@
-# TFEX Stateless Market Data Collector (1-Minute Snapshots)
+# TFEX Intraday Market Data Collector (Persistent Session Worker)
 
-โปรเจกต์ Python แบบ **Stateless Data Collector** สำหรับดึงข้อมูลตลาดอนุพันธ์ **TFEX** (SET50 Index, S50 Futures และ SET50 Options) ราย 1 นาที จาก **Settrade Open API (v2)** เพื่อรันบน **GitHub Actions** และบันทึกข้อมูลแบบ Batch ลงใน **Turso Cloud SQLite** ผ่าน HTTP Pipeline API (`/v2/pipeline`)
+โปรเจกต์ Python สถาปัตยกรรม **Persistent Session Worker** สำหรับดึงข้อมูลตลาดอนุพันธ์ **TFEX** (SET50 Index, S50 Futures และ SET50 Options) ราย 1 นาที จาก **Settrade Open API (v2)** เพื่อรันบน **GitHub Actions** ต่อเนื่องยาวตลอดช่วงการซื้อขายรอบเช้าและรอบบ่าย และบันทึกข้อมูลแบบ Batch ลงใน **Turso Cloud SQLite** ผ่าน HTTP Pipeline API (`/v2/pipeline`)
 
 ---
 
@@ -10,10 +10,10 @@
 .
 ├── .github/
 │   └── workflows/
-│       └── collect_tfex.yml   # GitHub Actions Workflow (cron 1 นาที + workflow_dispatch)
+│       └── collect_tfex.yml   # GitHub Actions Workflow (ปลุกรัน 2 รอบ/วัน + Persistent Session + manual dispatch)
 ├── .env.example               # ตัวอย่าง Environment Variables สำหรับรันทดสอบในเครื่อง
 ├── .gitignore                 # ป้องกันการ Commit secret หรือ cache
-├── collector.py               # สคริปต์หลักดึงข้อมูลและบันทึกลง Turso Cloud SQLite
+├── collector.py               # สคริปต์ Persistent Session Worker Loop และ Snapshot Collector
 ├── requirements.txt           # เฉพาะ settrade_v2, requests, pytz (ไร้ Library หนัก)
 └── README.md                  # เอกสารแนะนำการติดตั้งและตั้งค่า
 ```
@@ -159,24 +159,31 @@
    ```
 
 4. **รันทดสอบ:**
-   - **รันตามเงื่อนไขเวลาตลาดปกติ:**
+   - **รันโหมด Persistent Session Worker (ค่าเริ่มต้น):**
      ```bash
-     python collector.py
+     python collector.py --session
      ```
-     *(หากรันนอกเวลาทำการ หรือวันเสาร์-อาทิตย์ สคริปต์จะตรวจสอบว่าอยู่ในช่วง Checkpoint หรือไม่ หากอยู่นอกช่วงจะแจ้งเตือนและจบการทำงานทันที)*
+     *(หากเริ่มก่อนตลาดเปิด เช่น 09:15 น. หรือ 13:45 น. สคริปต์จะเข้าสู่โหมด Pre-Market Standby รอจนถึงเวลาเปิดตลาด แล้ววนลูปเก็บข้อมูลทุก 1 นาทีเป๊ะจนกระทั่งจบเซสชัน)*
 
-   - **บังคับรันทันที (Bypass Trading Hours Guard):**
+   - **รันดึงข้อมูล 1 ครั้งแล้วจบ (Single Snapshot):**
      ```bash
-     python collector.py --force
+     python collector.py --once
      ```
+
+   - **บังคับรันทันที (Bypass Trading Hours & Holiday Guards):**
+     ```bash
+     python collector.py --once --force
+     ```
+
    - **ทดสอบส่งรายงานสถานะเข้า Telegram ทันที (Manual Test):**
      ```bash
      python collector.py --notify
      ```
      *(ระบบจะดึงข้อมูลล่าสุดจาก Turso มาสรุปส่งเข้า Telegram ทันที โดยไม่บันทึกตัดสิทธิ์รอบจริงในตาราง `intraday_telegram_log`)*
+
    - **กำหนดจำนวน Worker Concurrency (ค่าเริ่มต้น: 8):**
      ```bash
-     python collector.py --force --workers 8 --max-rps 45
+     python collector.py --session --workers 8 --max-rps 45
      ```
 
 ---
@@ -184,9 +191,12 @@
 ## ⚡ การทำงานบน GitHub Actions
 
 - **ตารางรันอัตโนมัติ (Schedule):**
-  - ตั้ง `cron: '*/1 2-5,7-10 * * 1-5'` รันทุก 1 นาทีในวันจันทร์–ศุกร์ ครอบคลุมทั้งช่วงตลาดทำการและการส่งแจ้งเตือนทั้ง 4 Checkpoints (รอบเช้า 09:45–13:00 น. และรอบบ่าย 14:15–17:30 น. ตามเวลาไทย)
-  - ภายใน Job มีการจำกัด `timeout-minutes: 3` และเปิด `cache: 'pip'`
+  - ปลุกรันวันละ 2 รอบล่วงหน้าก่อนตลาดเปิด 30 นาที (วันจันทร์–ศุกร์) เพื่อขจัดข้อจำกัด Cron 5 นาทีของ GitHub และรองรับคิวดีเลย์:
+    - **รอบเช้า:** `15 2 * * 1-5` UTC (**09:15 น.** เวลาไทย) รันต่อเนื่องจนถึง **12:35 น.**
+    - **รอบบ่าย:** `45 6 * * 1-5` UTC (**13:45 น.** เวลาไทย) รันต่อเนื่องจนถึง **17:05 น.**
+  - ภายใน Job กำหนด `timeout-minutes: 240` (จำกัดสูงสุด 4 ชม. ต่อรอบ)
+  - สั่งรัน `python collector.py --session`
 - **สั่งรันด้วยมือ (Manual Dispatch):**
-  - สามารถไปที่แท็บ **Actions** บน GitHub -> เลือก **Collect TFEX 1-Minute Data** -> กด **Run workflow**
-  - ตัวเลือก `force_run` (ค่าเริ่มต้น: `true`) เพื่อสั่งดึงข้อมูลและบันทึกลง Turso ได้ทันที
-  - ตัวเลือก `notify_only` (ค่าเริ่มต้น: `false`) เพื่อสั่งส่งสรุปสถานะเข้า Telegram ทันทีโดยไม่ดึงข้อมูลใหม่
+  - ไปที่แท็บ **Actions** บน GitHub -> เลือก **Collect TFEX 1-Minute Data** -> กด **Run workflow**
+  - เลือกโหมด `mode`: `session`, `once`, หรือ `notify`
+  - ติ๊ก `force`: ข้ามด่านตรวจเวลาและวันหยุดเพื่อทดสอบทันทีได้ตามต้องการ

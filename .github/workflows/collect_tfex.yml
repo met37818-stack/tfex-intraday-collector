@@ -2,28 +2,33 @@ name: Collect TFEX 1-Minute Data
 
 on:
   schedule:
-    # Run every 1 minute during TFEX trading sessions and checkpoint alert windows (Mon-Fri)
-    # Morning: 09:45 - 13:00 BKK (02:45 - 06:00 UTC) -> UTC hours 2-5
-    # Afternoon: 14:15 - 17:30 BKK (07:15 - 10:30 UTC) -> UTC hours 7-10
-    - cron: '*/1 2-5,7-10 * * 1-5'
+    # Trigger 30 minutes before TFEX trading sessions to account for GitHub Actions queue delay:
+    # Morning Session:   09:15 BKK (02:15 UTC) -> '15 2 * * 1-5'
+    # Afternoon Session: 13:45 BKK (06:45 UTC) -> '45 6 * * 1-5'
+    - cron: '15 2 * * 1-5'
+    - cron: '45 6 * * 1-5'
   workflow_dispatch:
     inputs:
-      force_run:
-        description: 'Force run data collection (bypass trading hours guard)'
-        type: boolean
+      mode:
+        description: 'Execution mode'
+        type: choice
+        options:
+          - session
+          - once
+          - notify
         required: true
-        default: true
-      notify_only:
-        description: 'Send Telegram status notification only (--notify)'
+        default: session
+      force:
+        description: 'Bypass trading hours and holiday guards (--force)'
         type: boolean
         required: false
         default: false
 
 jobs:
   collect-tfex:
-    name: Collect TFEX Snapshot
+    name: TFEX Persistent Session Collector
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -52,13 +57,22 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.notify_only }}" = "true" ]; then
-            echo "[RUNNER] Manual dispatch with notify_only=true. Executing with --notify flag..."
-            python collector.py --notify
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force_run }}" = "true" ]; then
-            echo "[RUNNER] Manual dispatch with force_run=true. Executing with --force flag..."
-            python collector.py --force
+          FORCE_FLAG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ inputs.mode }}"
+            echo "[RUNNER] Manual dispatch with mode: $MODE $FORCE_FLAG"
+            if [ "$MODE" = "notify" ]; then
+              python collector.py --notify
+            elif [ "$MODE" = "once" ]; then
+              python collector.py --once $FORCE_FLAG
+            else
+              python collector.py --session $FORCE_FLAG
+            fi
           else
-            echo "[RUNNER] Regular scheduled trigger. Checking trading hours guard..."
-            python collector.py
+            echo "[RUNNER] Scheduled trigger: Starting persistent session worker..."
+            python collector.py --session
           fi
