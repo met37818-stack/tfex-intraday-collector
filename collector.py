@@ -668,6 +668,43 @@ def has_intraday_data_for_date(pipeline_url: str, auth_token: str, trade_date: s
     return False
 
 
+def is_worker_already_active(pipeline_url: str, auth_token: str, now_bkk: datetime, max_age_seconds: int = 180) -> bool:
+    """
+    Checks if another worker has captured ticks in futures_snapshots today within the last max_age_seconds (default 3 min).
+    Prevents duplicate concurrent workers (e.g. backup cron trigger while primary is running).
+    """
+    today_str = now_bkk.strftime("%Y-%m-%d")
+    sql = f"""
+    SELECT captured_at_bkk 
+    FROM futures_snapshots 
+    WHERE captured_at_bkk LIKE '{today_str}%' 
+    ORDER BY captured_at_bkk DESC 
+    LIMIT 1;
+    """
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "close"}
+    ]
+    try:
+        results = query_turso_pipeline(pipeline_url, auth_token, reqs)
+        if results and results[0].get("type") == "ok":
+            res = results[0]["response"]["result"]
+            rows = parse_turso_result_rows(res)
+            if rows and rows[0].get("captured_at_bkk"):
+                latest_ts_str = str(rows[0]["captured_at_bkk"])
+                latest_dt = BANGKOK_TZ.localize(datetime.strptime(latest_ts_str, "%Y-%m-%d %H:%M:%S"))
+                diff_sec = (now_bkk - latest_dt).total_seconds()
+                if 0 <= diff_sec < max_age_seconds:
+                    logger.info(
+                        f"[CONCURRENCY GUARD] Found active snapshot captured at {latest_ts_str} "
+                        f"({diff_sec:.0f}s ago < {max_age_seconds}s limit)."
+                    )
+                    return True
+    except Exception as e:
+        logger.warning(f"[CONCURRENCY GUARD] Warning checking active worker in Turso: {e}")
+    return False
+
+
 def get_latest_turso_trade_date(pipeline_url: str, auth_token: str) -> Optional[str]:
     sql = "SELECT MAX(SUBSTR(captured_at_bkk, 1, 10)) as latest_dt FROM spot_snapshots;"
     reqs = [
@@ -1389,6 +1426,12 @@ def run_session_worker(
             logger.info(f"[GUARD] Today ({today_str}) is an official SET/TFEX exchange holiday. Exiting gracefully (sys.exit(0)).")
             sys.exit(0)
 
+    # Concurrency Guard: Check if another worker is already actively capturing ticks
+    if not force and is_worker_already_active(turso_pipeline_url, turso_token, now_bkk):
+        print("Another worker is already active. Exiting cleanly.")
+        logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
+        sys.exit(0)
+
     # 2. Detect Session Window
     session_cfg = detect_session_window(now_bkk)
     if not session_cfg and not force:
@@ -1425,6 +1468,13 @@ def run_session_worker(
     if not force and now_bkk.time() < market_open_time:
         wait_for_market_open(market_open_time, session_name)
 
+    # Re-check Concurrency Guard after market open standby
+    now_bkk = datetime.now(BANGKOK_TZ)
+    if not force and is_worker_already_active(turso_pipeline_url, turso_token, now_bkk):
+        print("Another worker is already active. Exiting cleanly.")
+        logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
+        sys.exit(0)
+
     # 5. Resolve active contracts
     now_bkk = datetime.now(BANGKOK_TZ)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
@@ -1449,6 +1499,13 @@ def run_session_worker(
 
         ts_str = loop_now.strftime("%Y-%m-%d %H:%M:%S")
         logger.info(f"--- [TICK] Minute Bar Capture: {ts_str} (Session: {session_name}) ---")
+
+        # Concurrency check on first tick before calling Market Data API
+        if total_collected_bars == 0 and not force:
+            if is_worker_already_active(turso_pipeline_url, turso_token, loop_now):
+                print("Another worker is already active. Exiting cleanly.")
+                logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
+                sys.exit(0)
 
         # Proactive token re-auth check
         try:
