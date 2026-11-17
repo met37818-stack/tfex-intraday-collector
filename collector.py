@@ -13,6 +13,7 @@ Supports:
 
 import os
 import sys
+import re
 import time as pytime
 import argparse
 import calendar
@@ -812,18 +813,18 @@ LIMIT 1;""",
 def get_current_checkpoint(t: time) -> Optional[str]:
     """
     4-Checkpoint alert schedules:
-    1. MORNING_OPEN: 10:00 (10:00 - 10:30)
-    2. MIDDAY_CLOSE: 12:32 (12:32 - 13:00)
-    3. AFTERNOON_OPEN: 14:30 (14:30 - 15:00)
-    4. EVENING_CLOSE: 17:02 (17:02 - 17:30)
+    1. MORNING_OPEN: 10:00 (10:00 - 12:31:59) - Active across morning session once market opens
+    2. MIDDAY_CLOSE: 12:32 (12:32 - 13:30) - Midday break report
+    3. AFTERNOON_OPEN: 14:30 (14:30 - 17:01:59) - Active across afternoon session once market opens
+    4. EVENING_CLOSE: 17:02 (17:02 - 18:30) - Full-day close summary
     """
-    if time(10, 0) <= t <= time(10, 30):
+    if time(10, 0) <= t < time(12, 32):
         return "MORNING_OPEN"
-    if time(12, 32) <= t <= time(13, 0):
+    if time(12, 32) <= t <= time(13, 30):
         return "MIDDAY_CLOSE"
-    if time(14, 30) <= t <= time(15, 0):
+    if time(14, 30) <= t < time(17, 2):
         return "AFTERNOON_OPEN"
-    if time(17, 2) <= t <= time(17, 30):
+    if time(17, 2) <= t <= time(18, 30):
         return "EVENING_CLOSE"
     return None
 
@@ -948,16 +949,39 @@ def build_checkpoint_message(
     return f"{header}\n\n{body}"
 
 
+def escape_telegram_html(text: str) -> str:
+    """
+    Escapes raw <, >, and & characters for Telegram HTML parse_mode
+    while preserving supported Telegram tags (<b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, </a>).
+    """
+    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
+    placeholder_map = {}
+
+    def repl_tag(m):
+        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
+        placeholder_map[tok] = m.group(0)
+        return tok
+
+    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
+    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
+    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
+    for tok, orig in placeholder_map.items():
+        tokenized = tokenized.replace(tok, orig)
+
+    return tokenized
+
+
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": message,
+        "text": escape_telegram_html(message),
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
     try:
-        resp = _http_session.post(url, json=payload, timeout=10)
+        resp = _http_session.post(url, json=payload, timeout=15)
+        logger.info(f"[TELEGRAM] HTTP Status: {resp.status_code} | API Response: {resp.text}")
         if resp.status_code == 200 and resp.json().get("ok"):
             logger.info("Telegram alert sent successfully.")
             return True
@@ -1019,7 +1043,7 @@ def check_and_send_checkpoints(
 
     # 3. Check de-duplication log
     if is_checkpoint_already_notified(pipeline_url, turso_token, today_str, checkpoint):
-        logger.info(f"[TELEGRAM] Checkpoint {checkpoint} for {today_str} already sent today. Skipping.")
+        logger.debug(f"[TELEGRAM] Checkpoint {checkpoint} for {today_str} already sent today. Skipping.")
         return False
 
     # 4. Market-Open Data Guard
