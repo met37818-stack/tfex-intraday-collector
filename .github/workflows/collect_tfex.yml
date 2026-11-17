@@ -1,17 +1,6 @@
 name: Collect TFEX 1-Minute Data
 
 on:
-  schedule:
-    # Morning Session (09:45 - 12:35 BKK):
-    # Primary trigger: 09:15 BKK (02:15 UTC)
-    - cron: '15 2 * * 1-5'
-    # Backup trigger:  09:30 BKK (02:30 UTC) - backup if primary runner was queued/delayed
-    - cron: '30 2 * * 1-5'
-    # Afternoon Session (14:15 - 17:05 BKK):
-    # Primary trigger: 14:00 BKK (07:00 UTC)
-    - cron: '0 7 * * 1-5'
-    # Backup trigger:  14:15 BKK (07:15 UTC) - backup if primary runner was queued/delayed
-    - cron: '15 7 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
