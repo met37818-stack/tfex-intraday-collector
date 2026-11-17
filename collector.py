@@ -545,7 +545,7 @@ def query_turso_pipeline(pipeline_url: str, auth_token: str, requests_list: List
 
 
 def ensure_telegram_log_table(pipeline_url: str, auth_token: str) -> None:
-    ddl = """
+    ddl_tg = """
     CREATE TABLE IF NOT EXISTS intraday_telegram_log (
         trade_date TEXT NOT NULL,
         checkpoint TEXT NOT NULL,
@@ -553,14 +553,55 @@ def ensure_telegram_log_table(pipeline_url: str, auth_token: str) -> None:
         PRIMARY KEY (trade_date, checkpoint)
     );
     """
+    ddl_err = """
+    CREATE TABLE IF NOT EXISTS intraday_tick_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_date TEXT NOT NULL,
+        captured_at_bkk TEXT NOT NULL,
+        session_name TEXT,
+        error_type TEXT,
+        error_message TEXT
+    );
+    """
     reqs = [
-        {"type": "execute", "stmt": {"sql": ddl.strip()}},
+        {"type": "execute", "stmt": {"sql": ddl_tg.strip()}},
+        {"type": "execute", "stmt": {"sql": ddl_err.strip()}},
         {"type": "close"}
     ]
     try:
         query_turso_pipeline(pipeline_url, auth_token, reqs)
     except Exception as e:
-        logger.warning(f"Could not verify intraday_telegram_log table: {e}")
+        logger.warning(f"Could not verify intraday tables: {e}")
+
+
+def record_intraday_tick_error(
+    pipeline_url: str,
+    auth_token: str,
+    trade_date: str,
+    captured_at: str,
+    session_name: str,
+    error_type: str,
+    error_msg: str
+) -> None:
+    sql = """
+    INSERT INTO intraday_tick_errors (trade_date, captured_at_bkk, session_name, error_type, error_message)
+    VALUES (?, ?, ?, ?, ?);
+    """
+    args = [
+        to_turso_arg(trade_date),
+        to_turso_arg(captured_at),
+        to_turso_arg(session_name),
+        to_turso_arg(error_type),
+        to_turso_arg(error_msg[:300])
+    ]
+    reqs = [
+        {"type": "execute", "stmt": {"sql": sql.strip(), "args": args}},
+        {"type": "close"}
+    ]
+    try:
+        query_turso_pipeline(pipeline_url, auth_token, reqs)
+    except Exception as e:
+        logger.warning(f"Failed to record tick error into intraday_tick_errors: {e}")
 
 
 def is_checkpoint_already_notified(pipeline_url: str, auth_token: str, trade_date: str, checkpoint: str) -> bool:
@@ -645,6 +686,13 @@ def get_latest_turso_trade_date(pipeline_url: str, auth_token: str) -> Optional[
 
 
 def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: str) -> Dict[str, Any]:
+    try:
+        dt = datetime.strptime(trade_date, "%Y-%m-%d").replace(tzinfo=BANGKOK_TZ)
+    except Exception:
+        dt = datetime.now(BANGKOK_TZ)
+    cand_fut, front_opt, _ = resolve_active_series_candidates(dt)
+    front_fut_symbol = f"S50{front_opt}"
+
     sql_queries = [
         # 0. spot stats
         f"SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
@@ -652,8 +700,15 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
         f"SELECT last, volume, value, captured_at_bkk FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC LIMIT 1;",
         # 2. futures stats
         f"SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
-        # 3. latest front futures
-        f"SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC, symbol ASC LIMIT 1;",
+        # 3. latest front futures (Prioritize Front Quarter series e.g. S50Z26, then highest OI & volume)
+        f"""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk 
+FROM futures_snapshots 
+WHERE captured_at_bkk LIKE '{trade_date}%' 
+ORDER BY captured_at_bkk DESC, 
+         CASE WHEN symbol = '{front_fut_symbol}' THEN 1 ELSE 0 END DESC, 
+         open_interest DESC, 
+         volume DESC 
+LIMIT 1;""",
         # 4. options stats
         f"SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
         # 5. morning bars
@@ -663,7 +718,9 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
         # 7. pragma page_count
         "PRAGMA page_count;",
         # 8. pragma page_size
-        "PRAGMA page_size;"
+        "PRAGMA page_size;",
+        # 9. tick errors count
+        f"SELECT COUNT(*) as err_count FROM intraday_tick_errors WHERE trade_date = '{trade_date}';"
     ]
 
     reqs = [{"type": "execute", "stmt": {"sql": s}} for s in sql_queries]
@@ -699,7 +756,7 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
 
     # 3. Latest front futures
     r3 = get_first_row(3)
-    stats["fut_symbol"] = r3.get("symbol") or "S50"
+    stats["fut_symbol"] = r3.get("symbol") or front_fut_symbol
     stats["fut_last"] = r3.get("last")
     stats["fut_bid"] = r3.get("bid")
     stats["fut_ask"] = r3.get("ask")
@@ -722,17 +779,32 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
     stats["min_afternoon"] = r6.get("min_afternoon") or "-"
     stats["max_afternoon"] = r6.get("max_afternoon") or "-"
 
-    # 7 & 8. Database size
+    # 7 & 8. Database size & Turso 5 GB Quota
     r7 = get_first_row(7)
     r8 = get_first_row(8)
     page_count = r7.get("page_count") or 0
     page_size = r8.get("page_size") or 4096
     db_bytes = page_count * page_size
+    db_mb = db_bytes / (1024.0 * 1024.0)
+    quota_mb = 5120.0  # 5 GB free tier quota
+    quota_pct = (db_mb / quota_mb) * 100.0
+
     stats["db_pages"] = page_count
+    stats["db_bytes"] = db_bytes
+    stats["db_mb"] = db_mb
+    stats["quota_pct"] = quota_pct
+
     if db_bytes >= 1024 * 1024:
-        stats["db_size_str"] = f"{db_bytes / (1024 * 1024):.2f} MB"
+        db_raw_str = f"{db_mb:.2f} MB"
     else:
-        stats["db_size_str"] = f"{db_bytes / 1024:.1f} KB"
+        db_raw_str = f"{db_bytes / 1024.0:.1f} KB"
+
+    quota_warn = " 🚨 <b>ใกล้เต็มโควต้า 5 GB กรุณาเคลียร์ข้อมูลเก่า</b>" if quota_pct >= 80.0 else ""
+    stats["db_size_str"] = f"{db_raw_str} ({quota_pct:.2f}% ของโควต้า 5 GB){quota_warn}"
+
+    # 9. Error count
+    r9 = get_first_row(9)
+    stats["error_count"] = r9.get("err_count") or 0
 
     return stats
 
@@ -798,6 +870,8 @@ def build_checkpoint_message(
     max_ts = stats.get("max_ts", "-")
     db_size = stats.get("db_size_str", "-")
     db_pages = stats.get("db_pages", 0)
+    error_count = stats.get("error_count", 0)
+    err_str = "0 ครั้ง" if error_count == 0 else f"⚠️ {error_count} ครั้ง"
 
     spot_str = f"{spot_last:.2f}" if spot_last is not None else "N/A"
     fut_str = f"{fut_last:.2f}" if fut_last is not None else "N/A"
@@ -814,6 +888,7 @@ def build_checkpoint_message(
             f"• <b>SET50 Spot:</b> <code>{spot_str}</code> (Vol: {spot_vol:,.0f})\n"
             f"• <b>Front Futures ({fut_sym}):</b> <code>{fut_str}</code> (OI: {fut_oi:,.0f})\n"
             f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts ({opt_count} snaps)\n"
+            f"• <b>API/DB Errors:</b> {err_str}\n"
             f"• <b>Storage:</b> Turso SQLite {db_size}"
         )
     elif checkpoint == "MIDDAY_CLOSE":
@@ -827,6 +902,7 @@ def build_checkpoint_message(
             f"• <b>Morning Bars:</b> <b>{morning_bars}</b> / 165 ({m_pct:.1f}%)\n"
             f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
             f"• <b>Snapshots:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
+            f"• <b>API/DB Errors:</b> {err_str}\n"
             f"• <b>Health Check:</b> {health}\n"
             f"• <b>Storage:</b> Turso SQLite {db_size}"
         )
@@ -840,6 +916,7 @@ def build_checkpoint_message(
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
             f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
             f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts\n"
+            f"• <b>API/DB Errors:</b> {err_str}\n"
             f"• <b>Storage:</b> Turso SQLite {db_size}{warn}"
         )
     else:  # EVENING_CLOSE or MANUAL_REPORT
@@ -863,7 +940,8 @@ def build_checkpoint_message(
             f"  - Afternoon (14:15-17:05): {afternoon_bars} bars\n"
             f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
             f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
-            f"• <b>Database Storage:</b> <b>{db_size}</b> ({db_pages} pages)\n"
+            f"• <b>API/DB Errors:</b> {err_str}\n"
+            f"• <b>Storage:</b> Turso SQLite {db_size}\n"
             f"• <b>Integrity Verdict:</b> {verdict}"
         )
 
@@ -897,7 +975,8 @@ def check_and_send_checkpoints(
     turso_token: str,
     bot_token: str,
     chat_id: str,
-    force_notify: bool = False
+    force_notify: bool = False,
+    session_errors: int = 0
 ) -> bool:
     if not bot_token or not chat_id:
         logger.warning("[TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Checkpoint alerts skipped.")
@@ -922,6 +1001,8 @@ def check_and_send_checkpoints(
                 return False
 
         stats = query_turso_intraday_stats(pipeline_url, turso_token, target_date)
+        if session_errors > 0:
+            stats["error_count"] = max(stats.get("error_count", 0), session_errors)
         msg = build_checkpoint_message(checkpoint, target_date, now_bkk, stats, is_manual=True)
         logger.info(f"[NOTIFY] Sending Telegram report for {target_date} (Checkpoint: {checkpoint})...")
         return send_telegram_message(bot_token, chat_id, msg)
@@ -948,6 +1029,8 @@ def check_and_send_checkpoints(
 
     # 5. Query stats & send
     stats = query_turso_intraday_stats(pipeline_url, turso_token, today_str)
+    if session_errors > 0:
+        stats["error_count"] = max(stats.get("error_count", 0), session_errors)
     msg = build_checkpoint_message(checkpoint, today_str, now_bkk, stats, is_manual=False)
 
     logger.info(f"[TELEGRAM] Triggering {checkpoint} alert for {today_str}...")
@@ -1166,7 +1249,7 @@ def collect_and_save_snapshot(
 
     if total_records == 0:
         logger.warning(f"No records collected during tick at {timestamp_bkk_str}. Skipping Turso write.")
-        return 0, 0, 0
+        raise RuntimeError(f"Zero records collected from Settrade Open API at {timestamp_bkk_str} (Possible API Outage/Timeout)")
 
     # 4. Write to Turso via HTTP Pipeline
     payload = build_turso_pipeline_payload(spot_snapshots, futures_snapshots, options_snapshots)
@@ -1329,6 +1412,7 @@ def run_session_worker(
         market_verified = True
 
     total_collected_bars = 0
+    session_error_count = 0
 
     # 6. Session Worker Loop (1-minute drift-free exact loop)
     while True:
@@ -1365,7 +1449,21 @@ def run_session_worker(
             if spot_c > 0 or fut_c > 0 or opt_c > 0:
                 total_collected_bars += 1
         except Exception as e:
-            logger.warning(f"[TICK ERROR] Data collection or Turso write failed at {ts_str}: {e}")
+            session_error_count += 1
+            logger.warning(f"[TICK ERROR] Data collection or Turso write failed at {ts_str} (Session Error #{session_error_count}): {e}")
+            try:
+                record_intraday_tick_error(
+                    pipeline_url=turso_pipeline_url,
+                    auth_token=turso_token,
+                    trade_date=loop_now.strftime("%Y-%m-%d"),
+                    captured_at=ts_str,
+                    session_name=session_name,
+                    error_type=type(e).__name__,
+                    error_msg=str(e)
+                )
+            except Exception as rec_err:
+                logger.warning(f"Could not record tick error to Turso: {rec_err}")
+
             err_str = str(e).lower()
             if "auth" in err_str or "token" in err_str or "unauthorized" in err_str or "401" in err_str:
                 try:
@@ -1383,7 +1481,8 @@ def run_session_worker(
             try:
                 check_and_send_checkpoints(
                     datetime.now(BANGKOK_TZ), turso_pipeline_url, turso_token,
-                    telegram_bot_token, telegram_chat_id, force_notify=False
+                    telegram_bot_token, telegram_chat_id, force_notify=False,
+                    session_errors=session_error_count
                 )
             except Exception as e:
                 logger.warning(f"[TELEGRAM] Checkpoint alert error: {e}")
