@@ -1174,6 +1174,8 @@ def fetch_option_quote_task(
     try:
         quote = market_data.get_quote_symbol(symbol)
         if quote:
+            if "950" in symbol:
+                logger.info(f"[RAW OPTION QUOTE] {symbol}: {quote}")
             fields = extract_derivatives_data(quote)
             return {
                 "captured_at_bkk": timestamp_bkk_str,
@@ -1249,6 +1251,7 @@ def collect_and_save_snapshot(
         try:
             quote = market_data.get_quote_symbol(symbol)
             if quote:
+                logger.info(f"[RAW FUTURES QUOTE] {symbol}: {quote}")
                 fields = extract_derivatives_data(quote)
                 futures_snapshots.append({
                     "captured_at_bkk": timestamp_bkk_str,
