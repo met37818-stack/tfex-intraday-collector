@@ -1239,16 +1239,39 @@ class SettradeClientManager:
     def subscribe_symbols(self, symbols: List[str], max_limit: int = 38) -> None:
         if not self.realtime:
             return
+        target_set = set(symbols[:max_limit])
+        to_unsub: List[str] = []
+        candidates: List[str] = []
+
         with self._cache_lock:
-            already_subbed = set(self.subscribed_topics)
-            new_symbols = [s for s in symbols if s not in already_subbed]
-            allowed_count = max(0, max_limit - len(already_subbed))
-            to_sub = new_symbols[:allowed_count]
+            current_subbed = set(self.subscribed_topics)
+            # Free topic slots if new symbols would exceed quota
+            if len(current_subbed | target_set) > max_limit:
+                to_unsub = list(current_subbed - target_set)
+            candidates = [s for s in symbols if s not in current_subbed]
+
+        # Unsubscribe out-of-range topics to release MQTT quota
+        cb = getattr(self.realtime, "call_backer", None)
+        if to_unsub and cb:
+            for sym in to_unsub:
+                try:
+                    topic = f"proto/topic/bidofferv3/{sym}"
+                    cb.unsubscribe(topic)
+                    with self._cache_lock:
+                        self.subscribed_topics.discard(sym)
+                        self.bid_offer_cache.pop(sym, None)
+                except Exception as e:
+                    logger.debug(f"[REALTIME] Unsubscribe error for {sym}: {e}")
+
+        # Subscribe new priority topics within quota limit
+        with self._cache_lock:
+            available_slots = max(0, max_limit - len(self.subscribed_topics))
+            to_sub = [s for s in candidates if s not in self.subscribed_topics][:available_slots]
 
         if not to_sub:
             return
 
-        logger.info(f"[REALTIME] Subscribing {len(to_sub)} new symbols (Total: {len(already_subbed) + len(to_sub)}/{max_limit})...")
+        logger.info(f"[REALTIME] Subscribing {len(to_sub)} new symbols (Active: {len(self.subscribed_topics) + len(to_sub)}/{max_limit})...")
         for sym in to_sub:
             try:
                 sub = self.realtime.subscribe_bid_offer(sym, self.on_bid_offer)
