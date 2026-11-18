@@ -275,42 +275,27 @@ def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
     return list(range(min_strike, max_strike + 10, 10))
 
 
-def select_priority_arbitrage_symbols(
-    spot_ref: float,
+def generate_all_stream_symbols(
     front_series: str,
     next_series: str,
-    futures_candidates: List[str]
+    futures_candidates: List[str],
+    all_strikes: List[int]
 ) -> List[str]:
     """
-    Selects top liquid active symbols to subscribe via Settrade MQTT WebSocket.
-    Settrade Open API strictly limits connections to <= 40 topics.
-    Quota allocation:
-    - 2 active futures (Front + Next quarterly, e.g. S50Z26, S50H27) -> 2 topics
-    - Front series options: ATM ± 6 strikes (13 strikes * 2 = 26 C/P options) -> 26 topics
-    - Next series options: ATM ± 2 strikes (5 strikes * 2 = 10 C/P options) -> 10 topics
-    Total = 2 + 26 + 10 = 38 topics (<= 40 limit).
+    Generates all symbols across the entire active TFEX options and futures board.
+    No strike is skipped: covers all candidate futures, plus all strikes for both
+    Front and Next options series (Call and Put).
     """
     symbols: List[str] = []
+    # 1. Futures
+    for series_tag in futures_candidates:
+        symbols.append(f"S50{series_tag}")
 
-    # 1. Active Futures
-    if front_series:
-        symbols.append(f"S50{front_series}")
-    if next_series and f"S50{next_series}" not in symbols:
-        symbols.append(f"S50{next_series}")
-
-    atm_strike = round(spot_ref / 10.0) * 10.0
-
-    # 2. Front series options (ATM ± 6 strikes -> 13 strikes * 2 = 26 options)
-    front_strikes = [int(atm_strike + offset * 10) for offset in range(-6, 7)]
-    for k in front_strikes:
-        symbols.append(f"S50{front_series}C{k}")
-        symbols.append(f"S50{front_series}P{k}")
-
-    # 3. Next series options (ATM ± 2 strikes -> 5 strikes * 2 = 10 options)
-    next_strikes = [int(atm_strike + offset * 10) for offset in range(-2, 3)]
-    for k in next_strikes:
-        symbols.append(f"S50{next_series}C{k}")
-        symbols.append(f"S50{next_series}P{k}")
+    # 2. Options (All strikes for Front and Next series)
+    for opt_series in [front_series, next_series]:
+        for k in all_strikes:
+            symbols.append(f"S50{opt_series}C{k}")
+            symbols.append(f"S50{opt_series}P{k}")
 
     return symbols
 
@@ -1150,8 +1135,8 @@ class SettradeClientManager:
     """
     Manages Settrade Open API connection state, proactive re-authentication,
     and automatic recovery upon token expiration during long-running sessions.
-    Also manages RealtimeDataConnection (MQTT over WebSocket) streaming
-    to capture live Bid/Offer orderbook depth for active TFEX contracts.
+    Also manages a RealtimeDataConnection Connection Pool (MQTT over WebSocket)
+    to stream live Bid/Offer depth for 100% of all TFEX strikes without hitting topic limits.
     """
     def __init__(self, app_id: str, app_secret: str, broker_id: str, app_code: str, is_sandbox: bool):
         self.app_id = app_id
@@ -1161,11 +1146,22 @@ class SettradeClientManager:
         self.is_sandbox = is_sandbox
         self.investor: Optional[Investor] = None
         self.market_data: Any = None
-        self.realtime: Optional[Any] = None
+        self.realtime_connections: List[Any] = []
         self.bid_offer_cache: Dict[str, Dict[str, Any]] = {}
         self.subscribed_topics: Set[str] = set()
         self._cache_lock = threading.Lock()
         self.last_auth_time: float = 0.0
+
+    def stop_all_realtime(self) -> None:
+        """Safely stops and disconnects all MQTT WebSocket connections in the pool."""
+        with self._cache_lock:
+            for conn in self.realtime_connections:
+                try:
+                    conn._stop()
+                except Exception:
+                    pass
+            self.realtime_connections.clear()
+            self.subscribed_topics.clear()
 
     def connect(self) -> None:
         broker = self.broker_id
@@ -1187,30 +1183,16 @@ class SettradeClientManager:
             self.last_auth_time = pytime.time()
             logger.info("[SETTRADE] Open API authentication successful.")
 
-            # Initialize Realtime Streaming connection for Bid/Offer
-            self.init_realtime()
-
-            # Resubscribe existing topics if this is a reconnect
             with self._cache_lock:
                 prev_subs = list(self.subscribed_topics)
-                self.subscribed_topics.clear()
+            self.stop_all_realtime()
+
             if prev_subs:
                 self.subscribe_symbols(prev_subs)
 
         except Exception as e:
             logger.error(f"[SETTRADE] Authentication failed: {e}")
             raise RuntimeError(f"Settrade authentication failure: {e}") from e
-
-    def init_realtime(self) -> None:
-        if not self.investor:
-            return
-        logger.info("[SETTRADE] Initializing RealtimeDataConnection for Bid/Offer orderbook streaming...")
-        try:
-            self.realtime = self.investor.RealtimeDataConnection()
-            logger.info("[SETTRADE] RealtimeDataConnection initialized successfully.")
-        except Exception as e:
-            logger.warning(f"[SETTRADE] Could not initialize RealtimeDataConnection: {e}")
-            self.realtime = None
 
     def on_bid_offer(self, msg: Any) -> None:
         if not isinstance(msg, dict) or not msg.get("is_success"):
@@ -1236,50 +1218,43 @@ class SettradeClientManager:
         if sym.startswith("S50Z26") and not sym.startswith("S50Z26C") and not sym.startswith("S50Z26P"):
             logger.info(f"[REALTIME STREAM] {sym}: Bid={bid1} (Vol={bid_vol1}), Ask={ask1} (Vol={ask_vol1})")
 
-    def subscribe_symbols(self, symbols: List[str], max_limit: int = 38) -> None:
-        if not self.realtime:
-            return
-        target_set = set(symbols[:max_limit])
-        to_unsub: List[str] = []
-        candidates: List[str] = []
-
-        with self._cache_lock:
-            current_subbed = set(self.subscribed_topics)
-            # Free topic slots if new symbols would exceed quota
-            if len(current_subbed | target_set) > max_limit:
-                to_unsub = list(current_subbed - target_set)
-            candidates = [s for s in symbols if s not in current_subbed]
-
-        # Unsubscribe out-of-range topics to release MQTT quota
-        cb = getattr(self.realtime, "call_backer", None)
-        if to_unsub and cb:
-            for sym in to_unsub:
-                try:
-                    topic = f"proto/topic/bidofferv3/{sym}"
-                    cb.unsubscribe(topic)
-                    with self._cache_lock:
-                        self.subscribed_topics.discard(sym)
-                        self.bid_offer_cache.pop(sym, None)
-                except Exception as e:
-                    logger.debug(f"[REALTIME] Unsubscribe error for {sym}: {e}")
-
-        # Subscribe new priority topics within quota limit
-        with self._cache_lock:
-            available_slots = max(0, max_limit - len(self.subscribed_topics))
-            to_sub = [s for s in candidates if s not in self.subscribed_topics][:available_slots]
-
-        if not to_sub:
+    def subscribe_symbols(self, symbols: List[str], max_per_conn: int = 30) -> None:
+        """
+        Subscribes to all symbols across a pool of RealtimeDataConnection instances.
+        Each connection handles <= max_per_conn (default 30) topics, ensuring
+        Settrade's per-connection limit is NEVER exceeded while covering 100% of all strikes.
+        """
+        if not self.investor:
             return
 
-        logger.info(f"[REALTIME] Subscribing {len(to_sub)} new symbols (Active: {len(self.subscribed_topics) + len(to_sub)}/{max_limit})...")
-        for sym in to_sub:
+        with self._cache_lock:
+            new_symbols = [s for s in symbols if s not in self.subscribed_topics]
+
+        if not new_symbols:
+            return
+
+        chunks = [new_symbols[i:i + max_per_conn] for i in range(0, len(new_symbols), max_per_conn)]
+        logger.info(
+            f"[REALTIME POOL] Subscribing {len(new_symbols)} symbols across {len(chunks)} connection(s) "
+            f"(Total tracked: {len(self.subscribed_topics) + len(new_symbols)})..."
+        )
+
+        for chunk_idx, chunk in enumerate(chunks):
             try:
-                sub = self.realtime.subscribe_bid_offer(sym, self.on_bid_offer)
-                sub.start()
+                rt_conn = self.investor.RealtimeDataConnection()
                 with self._cache_lock:
-                    self.subscribed_topics.add(sym)
-            except Exception as e:
-                logger.warning(f"[REALTIME] Failed to subscribe {sym}: {e}")
+                    self.realtime_connections.append(rt_conn)
+                for sym in chunk:
+                    try:
+                        sub = rt_conn.subscribe_bid_offer(sym, self.on_bid_offer)
+                        sub.start()
+                        with self._cache_lock:
+                            self.subscribed_topics.add(sym)
+                    except Exception as sym_err:
+                        logger.debug(f"[REALTIME] Subscription error for {sym}: {sym_err}")
+                logger.info(f"[REALTIME POOL] Connection #{len(self.realtime_connections)} streaming {len(chunk)} symbols.")
+            except Exception as conn_err:
+                logger.warning(f"[REALTIME POOL] Failed to create connection for chunk #{chunk_idx}: {conn_err}")
 
     def get_bid_offer(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         with self._cache_lock:
@@ -1396,18 +1371,7 @@ def collect_and_save_snapshot(
     except Exception as e:
         logger.warning(f"Failed to fetch SET50 Spot: {e}")
 
-    # 2. Subscribe priority arbitrage symbols to Realtime Streaming (<= 40 topic limit)
-    if settrade_mgr:
-        base_spot = spot_price_ref or 920.0
-        priority_symbols = select_priority_arbitrage_symbols(
-            spot_ref=base_spot,
-            front_series=front_opt_series,
-            next_series=next_opt_series,
-            futures_candidates=futures_candidates
-        )
-        settrade_mgr.subscribe_symbols(priority_symbols)
-
-    # 3. Discover and Fetch Active S50 Futures
+    # 2. Discover and Fetch Active S50 Futures
     front_futures_price: Optional[float] = None
     for series_tag in futures_candidates:
         symbol = f"S50{series_tag}"
@@ -1442,9 +1406,19 @@ def collect_and_save_snapshot(
         except Exception as e:
             logger.warning(f"Error querying futures symbol {symbol}: {e}")
 
-    # 4. Fetch SET50 Options for All Active Strikes (Front & Next Series)
+    # 3. Fetch SET50 Options for All Active Strikes (Front & Next Series)
     atm_base = spot_price_ref or front_futures_price or 900.0
     all_strikes = generate_all_active_strikes(atm_base)
+
+    # Subscribe ALL candidate symbols across the entire board to Realtime Streaming Pool
+    if settrade_mgr:
+        all_stream_symbols = generate_all_stream_symbols(
+            front_series=front_opt_series,
+            next_series=next_opt_series,
+            futures_candidates=futures_candidates,
+            all_strikes=all_strikes
+        )
+        settrade_mgr.subscribe_symbols(all_stream_symbols)
 
     option_targets: List[Tuple[str, str, float, str]] = []
     for opt_series in [front_opt_series, next_opt_series]:
@@ -1792,14 +1766,15 @@ def run_single_snapshot(
         sys.exit(1)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
 
-    # Pre-subscribe priority arbitrage symbols to Realtime Streaming
-    p_symbols = select_priority_arbitrage_symbols(
-        spot_ref=920.0,
+    # Pre-subscribe ALL symbols across the entire board to Realtime Streaming Pool
+    all_strikes = generate_all_active_strikes(920.0)
+    all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
         next_series=next_opt_series,
-        futures_candidates=futures_candidates
+        futures_candidates=futures_candidates,
+        all_strikes=all_strikes
     )
-    settrade_mgr.subscribe_symbols(p_symbols)
+    settrade_mgr.subscribe_symbols(all_symbols)
     logger.info("[REALTIME] Waiting 2.0s for initial streaming quotes to arrive...")
     pytime.sleep(2.0)
 
