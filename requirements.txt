@@ -1,3 +1,5 @@
 settrade_v2
 requests
 pytz
+paho-mqtt<2,>=1.6
+

@@ -275,6 +275,46 @@ def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
     return list(range(min_strike, max_strike + 10, 10))
 
 
+def select_priority_arbitrage_symbols(
+    spot_ref: float,
+    front_series: str,
+    next_series: str,
+    futures_candidates: List[str]
+) -> List[str]:
+    """
+    Selects top liquid active symbols to subscribe via Settrade MQTT WebSocket.
+    Settrade Open API strictly limits connections to <= 40 topics.
+    Quota allocation:
+    - 2 active futures (Front + Next quarterly, e.g. S50Z26, S50H27) -> 2 topics
+    - Front series options: ATM ± 6 strikes (13 strikes * 2 = 26 C/P options) -> 26 topics
+    - Next series options: ATM ± 2 strikes (5 strikes * 2 = 10 C/P options) -> 10 topics
+    Total = 2 + 26 + 10 = 38 topics (<= 40 limit).
+    """
+    symbols: List[str] = []
+
+    # 1. Active Futures
+    if front_series:
+        symbols.append(f"S50{front_series}")
+    if next_series and f"S50{next_series}" not in symbols:
+        symbols.append(f"S50{next_series}")
+
+    atm_strike = round(spot_ref / 10.0) * 10.0
+
+    # 2. Front series options (ATM ± 6 strikes -> 13 strikes * 2 = 26 options)
+    front_strikes = [int(atm_strike + offset * 10) for offset in range(-6, 7)]
+    for k in front_strikes:
+        symbols.append(f"S50{front_series}C{k}")
+        symbols.append(f"S50{front_series}P{k}")
+
+    # 3. Next series options (ATM ± 2 strikes -> 5 strikes * 2 = 10 options)
+    next_strikes = [int(atm_strike + offset * 10) for offset in range(-2, 3)]
+    for k in next_strikes:
+        symbols.append(f"S50{next_series}C{k}")
+        symbols.append(f"S50{next_series}P{k}")
+
+    return symbols
+
+
 # ==============================================================================
 # 3. Data Extraction Helpers
 # ==============================================================================
@@ -1110,6 +1150,8 @@ class SettradeClientManager:
     """
     Manages Settrade Open API connection state, proactive re-authentication,
     and automatic recovery upon token expiration during long-running sessions.
+    Also manages RealtimeDataConnection (MQTT over WebSocket) streaming
+    to capture live Bid/Offer orderbook depth for active TFEX contracts.
     """
     def __init__(self, app_id: str, app_secret: str, broker_id: str, app_code: str, is_sandbox: bool):
         self.app_id = app_id
@@ -1119,6 +1161,10 @@ class SettradeClientManager:
         self.is_sandbox = is_sandbox
         self.investor: Optional[Investor] = None
         self.market_data: Any = None
+        self.realtime: Optional[Any] = None
+        self.bid_offer_cache: Dict[str, Dict[str, Any]] = {}
+        self.subscribed_topics: Set[str] = set()
+        self._cache_lock = threading.Lock()
         self.last_auth_time: float = 0.0
 
     def connect(self) -> None:
@@ -1140,9 +1186,84 @@ class SettradeClientManager:
             self.market_data = self.investor.MarketData()
             self.last_auth_time = pytime.time()
             logger.info("[SETTRADE] Open API authentication successful.")
+
+            # Initialize Realtime Streaming connection for Bid/Offer
+            self.init_realtime()
+
+            # Resubscribe existing topics if this is a reconnect
+            with self._cache_lock:
+                prev_subs = list(self.subscribed_topics)
+                self.subscribed_topics.clear()
+            if prev_subs:
+                self.subscribe_symbols(prev_subs)
+
         except Exception as e:
             logger.error(f"[SETTRADE] Authentication failed: {e}")
             raise RuntimeError(f"Settrade authentication failure: {e}") from e
+
+    def init_realtime(self) -> None:
+        if not self.investor:
+            return
+        logger.info("[SETTRADE] Initializing RealtimeDataConnection for Bid/Offer orderbook streaming...")
+        try:
+            self.realtime = self.investor.RealtimeDataConnection()
+            logger.info("[SETTRADE] RealtimeDataConnection initialized successfully.")
+        except Exception as e:
+            logger.warning(f"[SETTRADE] Could not initialize RealtimeDataConnection: {e}")
+            self.realtime = None
+
+    def on_bid_offer(self, msg: Any) -> None:
+        if not isinstance(msg, dict) or not msg.get("is_success"):
+            return
+        data = msg.get("data")
+        if not isinstance(data, dict):
+            return
+        sym = data.get("symbol")
+        if not sym:
+            return
+        bid1 = safe_float(data.get("bid_price1"))
+        ask1 = safe_float(data.get("ask_price1"))
+        bid_vol1 = data.get("bid_volume1") or 0
+        ask_vol1 = data.get("ask_volume1") or 0
+        with self._cache_lock:
+            self.bid_offer_cache[sym] = {
+                "bid": bid1 if (bid1 is not None and bid1 > 0) else None,
+                "ask": ask1 if (ask1 is not None and ask1 > 0) else None,
+                "bid_volume": bid_vol1,
+                "ask_volume": ask_vol1,
+                "updated_at": pytime.time()
+            }
+        if sym.startswith("S50Z26") and not sym.startswith("S50Z26C") and not sym.startswith("S50Z26P"):
+            logger.info(f"[REALTIME STREAM] {sym}: Bid={bid1} (Vol={bid_vol1}), Ask={ask1} (Vol={ask_vol1})")
+
+    def subscribe_symbols(self, symbols: List[str], max_limit: int = 38) -> None:
+        if not self.realtime:
+            return
+        with self._cache_lock:
+            already_subbed = set(self.subscribed_topics)
+            new_symbols = [s for s in symbols if s not in already_subbed]
+            allowed_count = max(0, max_limit - len(already_subbed))
+            to_sub = new_symbols[:allowed_count]
+
+        if not to_sub:
+            return
+
+        logger.info(f"[REALTIME] Subscribing {len(to_sub)} new symbols (Total: {len(already_subbed) + len(to_sub)}/{max_limit})...")
+        for sym in to_sub:
+            try:
+                sub = self.realtime.subscribe_bid_offer(sym, self.on_bid_offer)
+                sub.start()
+                with self._cache_lock:
+                    self.subscribed_topics.add(sym)
+            except Exception as e:
+                logger.warning(f"[REALTIME] Failed to subscribe {sym}: {e}")
+
+    def get_bid_offer(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+        with self._cache_lock:
+            entry = self.bid_offer_cache.get(symbol)
+            if entry:
+                return entry.get("bid"), entry.get("ask")
+            return None, None
 
     def ensure_authenticated(self, max_age_seconds: float = 7200.0) -> None:
         """Proactively re-authenticates if token age exceeds max_age_seconds (default 2 hours)."""
@@ -1166,7 +1287,8 @@ def fetch_option_quote_task(
     strike: float,
     opt_type: str,
     timestamp_bkk_str: str,
-    limiter: Optional[PacedRateLimiter] = None
+    limiter: Optional[PacedRateLimiter] = None,
+    settrade_mgr: Optional[SettradeClientManager] = None
 ) -> Optional[Dict[str, Any]]:
     if limiter:
         limiter.acquire()
@@ -1174,9 +1296,15 @@ def fetch_option_quote_task(
     try:
         quote = market_data.get_quote_symbol(symbol)
         if quote:
-            if "950" in symbol:
-                logger.info(f"[RAW OPTION QUOTE] {symbol}: {quote}")
             fields = extract_derivatives_data(quote)
+            # Enrich with live streaming Bid/Ask if available
+            if settrade_mgr:
+                rt_bid, rt_ask = settrade_mgr.get_bid_offer(symbol)
+                if rt_bid is not None:
+                    fields["bid"] = rt_bid
+                if rt_ask is not None:
+                    fields["ask"] = rt_ask
+
             return {
                 "captured_at_bkk": timestamp_bkk_str,
                 "symbol": symbol,
@@ -1207,7 +1335,8 @@ def collect_and_save_snapshot(
     now_bkk: datetime,
     front_opt_series: str,
     next_opt_series: str,
-    futures_candidates: List[str]
+    futures_candidates: List[str],
+    settrade_mgr: Optional[SettradeClientManager] = None
 ) -> Tuple[int, int, int]:
     """
     Performs atomic 1-minute market snapshot collection (Spot, Futures, Options)
@@ -1244,25 +1373,32 @@ def collect_and_save_snapshot(
     except Exception as e:
         logger.warning(f"Failed to fetch SET50 Spot: {e}")
 
-    # 2. Discover and Fetch Active S50 Futures
-    front_futures_price: Optional[float] = None
-    test_symbol = "S50Z26"
-    for subpath in ["quote", "futures", "options", "bidoffer", "bid-offer", "price-info", "top10"]:
-        test_url = f"{market_data.market_url}/{subpath}/{test_symbol}"
-        try:
-            from settrade_v2.context import Option
-            res = market_data._ctx.dispatch(Option("GET", test_url))
-            logger.info(f"[PROBE SUCCESS] {subpath}: status={res.status_code}, payload={res.json()}")
-        except Exception as e:
-            logger.info(f"[PROBE FAIL] {subpath}: {e}")
+    # 2. Subscribe priority arbitrage symbols to Realtime Streaming (<= 40 topic limit)
+    if settrade_mgr:
+        base_spot = spot_price_ref or 920.0
+        priority_symbols = select_priority_arbitrage_symbols(
+            spot_ref=base_spot,
+            front_series=front_opt_series,
+            next_series=next_opt_series,
+            futures_candidates=futures_candidates
+        )
+        settrade_mgr.subscribe_symbols(priority_symbols)
 
+    # 3. Discover and Fetch Active S50 Futures
+    front_futures_price: Optional[float] = None
     for series_tag in futures_candidates:
         symbol = f"S50{series_tag}"
         try:
             quote = market_data.get_quote_symbol(symbol)
             if quote:
-                logger.info(f"[RAW FUTURES QUOTE] {symbol}: {quote}")
                 fields = extract_derivatives_data(quote)
+                if settrade_mgr:
+                    rt_bid, rt_ask = settrade_mgr.get_bid_offer(symbol)
+                    if rt_bid is not None:
+                        fields["bid"] = rt_bid
+                    if rt_ask is not None:
+                        fields["ask"] = rt_ask
+
                 futures_snapshots.append({
                     "captured_at_bkk": timestamp_bkk_str,
                     "symbol": symbol,
@@ -1283,7 +1419,7 @@ def collect_and_save_snapshot(
         except Exception as e:
             logger.warning(f"Error querying futures symbol {symbol}: {e}")
 
-    # 3. Fetch SET50 Options for All Active Strikes (Front & Next Series)
+    # 4. Fetch SET50 Options for All Active Strikes (Front & Next Series)
     atm_base = spot_price_ref or front_futures_price or 900.0
     all_strikes = generate_all_active_strikes(atm_base)
 
@@ -1305,7 +1441,8 @@ def collect_and_save_snapshot(
                 stk,
                 otp,
                 timestamp_bkk_str,
-                pacer
+                pacer,
+                settrade_mgr
             )
             for (sym, ser, stk, otp) in option_targets
         ]
@@ -1538,7 +1675,8 @@ def run_session_worker(
                 now_bkk=loop_now,
                 front_opt_series=front_opt_series,
                 next_opt_series=next_opt_series,
-                futures_candidates=futures_candidates
+                futures_candidates=futures_candidates,
+                settrade_mgr=settrade_mgr
             )
             if spot_c > 0 or fut_c > 0 or opt_c > 0:
                 total_collected_bars += 1
@@ -1631,6 +1769,17 @@ def run_single_snapshot(
         sys.exit(1)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
 
+    # Pre-subscribe priority arbitrage symbols to Realtime Streaming
+    p_symbols = select_priority_arbitrage_symbols(
+        spot_ref=920.0,
+        front_series=front_opt_series,
+        next_series=next_opt_series,
+        futures_candidates=futures_candidates
+    )
+    settrade_mgr.subscribe_symbols(p_symbols)
+    logger.info("[REALTIME] Waiting 2.0s for initial streaming quotes to arrive...")
+    pytime.sleep(2.0)
+
     spot_c, fut_c, opt_c = collect_and_save_snapshot(
         market_data=settrade_mgr.market_data,
         turso_pipeline_url=turso_pipeline_url,
@@ -1641,7 +1790,8 @@ def run_single_snapshot(
         now_bkk=now_bkk,
         front_opt_series=front_opt_series,
         next_opt_series=next_opt_series,
-        futures_candidates=futures_candidates
+        futures_candidates=futures_candidates,
+        settrade_mgr=settrade_mgr
     )
 
     if telegram_bot_token and telegram_chat_id:
