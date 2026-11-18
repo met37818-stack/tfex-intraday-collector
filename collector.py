@@ -1246,6 +1246,16 @@ def collect_and_save_snapshot(
 
     # 2. Discover and Fetch Active S50 Futures
     front_futures_price: Optional[float] = None
+    test_symbol = "S50Z26"
+    for subpath in ["quote", "futures", "options", "bidoffer", "bid-offer", "price-info", "top10"]:
+        test_url = f"{market_data.market_url}/{subpath}/{test_symbol}"
+        try:
+            from settrade_v2.context import Option
+            res = market_data._ctx.dispatch(Option("GET", test_url))
+            logger.info(f"[PROBE SUCCESS] {subpath}: status={res.status_code}, payload={res.json()}")
+        except Exception as e:
+            logger.info(f"[PROBE FAIL] {subpath}: {e}")
+
     for series_tag in futures_candidates:
         symbol = f"S50{series_tag}"
         try:
