@@ -1840,6 +1840,31 @@ def load_dotenv_simple(env_path: str = ".env") -> None:
             logger.warning(f"Could not read .env file: {e}")
 
 
+def run_clean_db(pipeline_url: str, auth_token: str) -> None:
+    """
+    Cleans incomplete/stale intraday snapshot data and logs from Turso Cloud SQLite.
+    Preserves thor_rates and other non-intraday reference tables.
+    """
+    logger.info("[CLEAN] Purging stale/incomplete intraday data from Turso Cloud SQLite...")
+    clean_stmts = [
+        {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "DELETE FROM spot_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "DELETE FROM intraday_tick_errors;"}},
+        {"type": "execute", "stmt": {"sql": "DELETE FROM intraday_telegram_log;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM options_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM futures_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots;"}},
+    ]
+    results = query_turso_pipeline(pipeline_url, auth_token, clean_stmts)
+    opt_cnt = results[5].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
+    fut_cnt = results[6].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
+    spot_cnt = results[7].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
+    logger.info(f"[CLEAN] Database tables cleared. Post-clean row counts: Options={opt_cnt}, Futures={fut_cnt}, Spot={spot_cnt}")
+    print(f"✅ Clean complete: options_snapshots ({opt_cnt}), futures_snapshots ({fut_cnt}), spot_snapshots ({spot_cnt}). Ready for fresh start.")
+    sys.exit(0)
+
+
 # ==============================================================================
 # 10. CLI Parser & Main Entrypoint
 # ==============================================================================
@@ -1856,6 +1881,11 @@ def main() -> None:
         "--once",
         action="store_true",
         help="Run a single collection snapshot and exit."
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Purge all old incomplete intraday snapshot data and logs from Turso Cloud SQLite."
     )
     parser.add_argument(
         "--notify",
@@ -1895,6 +1925,14 @@ def main() -> None:
     turso_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     telegram_bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    # Mode: --clean
+    if args.clean:
+        if not turso_url or not turso_token:
+            logger.error("Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN for --clean mode.")
+            sys.exit(1)
+        turso_pipeline_url = normalize_turso_pipeline_url(turso_url)
+        run_clean_db(turso_pipeline_url, turso_token)
 
     # Mode: --notify
     if args.notify:
