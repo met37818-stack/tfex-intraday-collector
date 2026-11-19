@@ -396,6 +396,8 @@ def build_turso_pipeline_payload(
         symbol TEXT NOT NULL,
         bid REAL,
         ask REAL,
+        bid_vol REAL,
+        ask_vol REAL,
         last REAL,
         volume REAL,
         open_interest REAL
@@ -411,6 +413,8 @@ def build_turso_pipeline_payload(
         option_type TEXT NOT NULL,
         bid REAL,
         ask REAL,
+        bid_vol REAL,
+        ask_vol REAL,
         last REAL,
         volume REAL,
         open_interest REAL
@@ -448,18 +452,20 @@ def build_turso_pipeline_payload(
         })
 
     insert_futures_sql = """
-    INSERT INTO futures_snapshots (captured_at_bkk, symbol, bid, ask, last, volume, open_interest)
-    VALUES (?, ?, ?, ?, ?, ?, ?);
+    INSERT INTO futures_snapshots (captured_at_bkk, symbol, bid, ask, bid_vol, ask_vol, last, volume, open_interest)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
     for r in futures_rows:
         args = [
             to_turso_arg(r["captured_at_bkk"]),
             to_turso_arg(r["symbol"]),
-            to_turso_arg(r["bid"]),
-            to_turso_arg(r["ask"]),
-            to_turso_arg(r["last"]),
-            to_turso_arg(r["volume"]),
-            to_turso_arg(r["open_interest"]),
+            to_turso_arg(r.get("bid")),
+            to_turso_arg(r.get("ask")),
+            to_turso_arg(r.get("bid_vol")),
+            to_turso_arg(r.get("ask_vol")),
+            to_turso_arg(r.get("last")),
+            to_turso_arg(r.get("volume")),
+            to_turso_arg(r.get("open_interest")),
         ]
         requests_list.append({
             "type": "execute",
@@ -468,8 +474,8 @@ def build_turso_pipeline_payload(
 
     insert_options_sql = """
     INSERT INTO options_snapshots (
-        captured_at_bkk, symbol, series, strike, option_type, bid, ask, last, volume, open_interest
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        captured_at_bkk, symbol, series, strike, option_type, bid, ask, bid_vol, ask_vol, last, volume, open_interest
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
     for r in options_rows:
         args = [
@@ -478,11 +484,13 @@ def build_turso_pipeline_payload(
             to_turso_arg(r["series"]),
             to_turso_arg(r["strike"]),
             to_turso_arg(r["option_type"]),
-            to_turso_arg(r["bid"]),
-            to_turso_arg(r["ask"]),
-            to_turso_arg(r["last"]),
-            to_turso_arg(r["volume"]),
-            to_turso_arg(r["open_interest"]),
+            to_turso_arg(r.get("bid")),
+            to_turso_arg(r.get("ask")),
+            to_turso_arg(r.get("bid_vol")),
+            to_turso_arg(r.get("ask_vol")),
+            to_turso_arg(r.get("last")),
+            to_turso_arg(r.get("volume")),
+            to_turso_arg(r.get("open_interest")),
         ]
         requests_list.append({
             "type": "execute",
@@ -522,6 +530,61 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
         raise RuntimeError(f"Turso SQL execution error: {errors[0]}")
 
     logger.info("Turso HTTP pipeline batch write committed successfully.")
+
+
+def ensure_database_schema(pipeline_url: str, auth_token: str) -> None:
+    """Ensures bid_vol and ask_vol columns exist on futures_snapshots and options_snapshots."""
+    alter_stmts = [
+        "ALTER TABLE futures_snapshots ADD COLUMN bid_vol REAL;",
+        "ALTER TABLE futures_snapshots ADD COLUMN ask_vol REAL;",
+        "ALTER TABLE options_snapshots ADD COLUMN bid_vol REAL;",
+        "ALTER TABLE options_snapshots ADD COLUMN ask_vol REAL;"
+    ]
+    for sql in alter_stmts:
+        req = {"requests": [{"type": "execute", "stmt": {"sql": sql}}, {"type": "close"}]}
+        try:
+            query_turso_pipeline(pipeline_url, auth_token, req["requests"])
+        except Exception:
+            pass  # Column already exists or error ignored safely
+
+
+def is_tick_changed(prev: Optional[Dict[str, Any]], curr: Dict[str, Any]) -> bool:
+    """
+    Evaluates whether a market tick represents a meaningful change across 6 dimensions:
+    - Best Bid price
+    - Best Ask price
+    - Best Bid volume (depth)
+    - Best Ask volume (depth)
+    - Last traded price
+    - Cumulative traded volume
+    """
+    if prev is None:
+        return True
+    return (
+        prev.get("bid") != curr.get("bid") or
+        prev.get("ask") != curr.get("ask") or
+        prev.get("bid_vol") != curr.get("bid_vol") or
+        prev.get("ask_vol") != curr.get("ask_vol") or
+        prev.get("last") != curr.get("last") or
+        prev.get("volume") != curr.get("volume")
+    )
+
+
+def save_cdc_batch_to_turso(
+    pipeline_url: str,
+    auth_token: str,
+    futures_rows: List[Dict[str, Any]],
+    options_rows: List[Dict[str, Any]],
+    spot_rows: Optional[List[Dict[str, Any]]] = None
+) -> None:
+    if not futures_rows and not options_rows and not spot_rows:
+        return
+    payload = build_turso_pipeline_payload(
+        spot_rows or [],
+        futures_rows,
+        options_rows
+    )
+    execute_turso_pipeline(pipeline_url, auth_token, payload)
 
 
 # ==============================================================================
@@ -896,7 +959,8 @@ def build_checkpoint_message(
     trade_date: str,
     now_bkk: datetime,
     stats: Dict[str, Any],
-    is_manual: bool = False
+    is_manual: bool = False,
+    cdc_stats: Optional[Dict[str, int]] = None
 ) -> str:
     date_str = now_bkk.strftime("%Y%m%d")
     time_str = now_bkk.strftime("%H:%M")
@@ -1008,7 +1072,22 @@ def build_checkpoint_message(
             f"• <b>Integrity Verdict:</b> {verdict}"
         )
 
-    return f"{header}\n\n{body}"
+    cdc_sec = ""
+    if cdc_stats:
+        rcv = cdc_stats.get("received", 0)
+        chg = cdc_stats.get("changed", 0)
+        ded = cdc_stats.get("deduped", 0)
+        fls = cdc_stats.get("flushes", 0)
+        rows_w = cdc_stats.get("rows_written", 0)
+        ded_pct = (ded / rcv * 100.0) if rcv > 0 else 0.0
+        cdc_sec = (
+            f"\n\n⚡ <b>CDC Stream Stats:</b>\n"
+            f"• <b>Ticks:</b> <code>{rcv:,}</code> received | <code>{chg:,}</code> changed\n"
+            f"• <b>Noise Filter:</b> <code>{ded:,}</code> filtered ({ded_pct:.1f}% reduction)\n"
+            f"• <b>Turso Flushes:</b> <code>{fls:,}</code> batches ({rows_w:,} rows written)"
+        )
+
+    return f"{header}\n\n{body}{cdc_sec}"
 
 
 def escape_telegram_html(text: str) -> str:
@@ -1062,7 +1141,8 @@ def check_and_send_checkpoints(
     bot_token: str,
     chat_id: str,
     force_notify: bool = False,
-    session_errors: int = 0
+    session_errors: int = 0,
+    cdc_stats: Optional[Dict[str, int]] = None
 ) -> bool:
     if not bot_token or not chat_id:
         logger.warning("[TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. Checkpoint alerts skipped.")
@@ -1089,7 +1169,7 @@ def check_and_send_checkpoints(
         stats = query_turso_intraday_stats(pipeline_url, turso_token, target_date)
         if session_errors > 0:
             stats["error_count"] = max(stats.get("error_count", 0), session_errors)
-        msg = build_checkpoint_message(checkpoint, target_date, now_bkk, stats, is_manual=True)
+        msg = build_checkpoint_message(checkpoint, target_date, now_bkk, stats, is_manual=True, cdc_stats=cdc_stats)
         logger.info(f"[NOTIFY] Sending Telegram report for {target_date} (Checkpoint: {checkpoint})...")
         return send_telegram_message(bot_token, chat_id, msg)
 
@@ -1117,7 +1197,7 @@ def check_and_send_checkpoints(
     stats = query_turso_intraday_stats(pipeline_url, turso_token, today_str)
     if session_errors > 0:
         stats["error_count"] = max(stats.get("error_count", 0), session_errors)
-    msg = build_checkpoint_message(checkpoint, today_str, now_bkk, stats, is_manual=False)
+    msg = build_checkpoint_message(checkpoint, today_str, now_bkk, stats, is_manual=False, cdc_stats=cdc_stats)
 
     logger.info(f"[TELEGRAM] Triggering {checkpoint} alert for {today_str}...")
     success = send_telegram_message(bot_token, chat_id, msg)
@@ -1151,6 +1231,19 @@ class SettradeClientManager:
         self.subscribed_topics: Set[str] = set()
         self._cache_lock = threading.Lock()
         self.last_auth_time: float = 0.0
+
+        # Change Data Capture (CDC) State & Coalescing Buffer
+        self.latest_market_state: Dict[str, Dict[str, Any]] = {}
+        self.last_persisted_state: Dict[str, Dict[str, Any]] = {}
+        self.coalesced_buffer: Dict[str, Dict[str, Any]] = {}
+        self.last_tick_time: float = pytime.time()
+        self.cdc_stats: Dict[str, int] = {
+            "received": 0,
+            "changed": 0,
+            "deduped": 0,
+            "flushes": 0,
+            "rows_written": 0
+        }
 
     def stop_all_realtime(self) -> None:
         """Safely stops and disconnects all MQTT WebSocket connections in the pool."""
@@ -1203,26 +1296,52 @@ class SettradeClientManager:
         sym = data.get("symbol")
         if not sym:
             return
+
         bid1 = safe_float(data.get("bid_price1"))
         ask1 = safe_float(data.get("ask_price1"))
-        bid_vol1 = data.get("bid_volume1") or 0
-        ask_vol1 = data.get("ask_volume1") or 0
+        bid_vol1 = safe_float(data.get("bid_volume1")) or 0.0
+        ask_vol1 = safe_float(data.get("ask_volume1")) or 0.0
+        last_p = safe_float(data.get("last"))
+        vol = safe_float(data.get("total_volume")) or safe_float(data.get("volume")) or 0.0
+
+        now_bkk = datetime.now(BANGKOK_TZ)
+        ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+
+        current_tick = {
+            "symbol": sym,
+            "bid": bid1 if (bid1 is not None and bid1 > 0) else None,
+            "ask": ask1 if (ask1 is not None and ask1 > 0) else None,
+            "bid_vol": bid_vol1,
+            "ask_vol": ask_vol1,
+            "last": last_p,
+            "volume": vol,
+            "captured_at_bkk": ts_str,
+            "updated_at": pytime.time()
+        }
+
         with self._cache_lock:
-            self.bid_offer_cache[sym] = {
-                "bid": bid1 if (bid1 is not None and bid1 > 0) else None,
-                "ask": ask1 if (ask1 is not None and ask1 > 0) else None,
-                "bid_volume": bid_vol1,
-                "ask_volume": ask_vol1,
-                "updated_at": pytime.time()
-            }
+            self.last_tick_time = pytime.time()
+            self.cdc_stats["received"] += 1
+            self.bid_offer_cache[sym] = current_tick
+            self.latest_market_state[sym] = current_tick
+
+            prev_state = self.coalesced_buffer.get(sym) or self.last_persisted_state.get(sym)
+            if is_tick_changed(prev_state, current_tick):
+                self.cdc_stats["changed"] += 1
+                # Coalescing: keep only latest state per symbol in this 3s window
+                self.coalesced_buffer[sym] = current_tick
+            else:
+                self.cdc_stats["deduped"] += 1
+
         if sym.startswith("S50Z26") and not sym.startswith("S50Z26C") and not sym.startswith("S50Z26P"):
             logger.info(f"[REALTIME STREAM] {sym}: Bid={bid1} (Vol={bid_vol1}), Ask={ask1} (Vol={ask_vol1})")
 
-    def subscribe_symbols(self, symbols: List[str], max_per_conn: int = 30) -> None:
+    def subscribe_symbols(self, symbols: List[str], max_per_conn: int = 35) -> None:
         """
         Subscribes to all symbols across a pool of RealtimeDataConnection instances.
-        Each connection handles <= max_per_conn (default 30) topics, ensuring
-        Settrade's per-connection limit is NEVER exceeded while covering 100% of all strikes.
+        Each connection handles <= max_per_conn (default 35) topics, ensuring
+        Settrade's per-connection limit (40) is NEVER exceeded while covering 100% of all strikes.
+        Uses staggered handshake (250ms delay) to prevent connection storms.
         """
         if not self.investor:
             return
@@ -1240,6 +1359,8 @@ class SettradeClientManager:
         )
 
         for chunk_idx, chunk in enumerate(chunks):
+            if chunk_idx > 0:
+                pytime.sleep(0.25)  # Staggered connect to avoid broker connection storms
             try:
                 rt_conn = self.investor.RealtimeDataConnection()
                 with self._cache_lock:
@@ -1255,6 +1376,150 @@ class SettradeClientManager:
                 logger.info(f"[REALTIME POOL] Connection #{len(self.realtime_connections)} streaming {len(chunk)} symbols.")
             except Exception as conn_err:
                 logger.warning(f"[REALTIME POOL] Failed to create connection for chunk #{chunk_idx}: {conn_err}")
+
+    def flush_coalesced_buffer(self, turso_pipeline_url: str, turso_token: str) -> int:
+        """
+        Flushes coalesced changes to Turso in a single batch.
+        Caps writes at maximum 1 row per symbol per 3-second cycle.
+        """
+        with self._cache_lock:
+            if not self.coalesced_buffer:
+                return 0
+            items_to_flush = list(self.coalesced_buffer.values())
+            self.coalesced_buffer.clear()
+            for it in items_to_flush:
+                self.last_persisted_state[it["symbol"]] = it
+
+        futures_rows = []
+        options_rows = []
+        for it in items_to_flush:
+            sym = it["symbol"]
+            if sym.startswith("S50") and ("C" in sym[6:] or "P" in sym[6:]):
+                m = re.match(r"^S50([A-Z]\d{2})([CP])(\d+)$", sym)
+                if m:
+                    ser, o_type, k_str = m.groups()
+                    options_rows.append({
+                        "captured_at_bkk": it["captured_at_bkk"],
+                        "symbol": sym,
+                        "series": ser,
+                        "strike": float(k_str),
+                        "option_type": o_type,
+                        "bid": it["bid"],
+                        "ask": it["ask"],
+                        "bid_vol": it["bid_vol"],
+                        "ask_vol": it["ask_vol"],
+                        "last": it["last"],
+                        "volume": it["volume"],
+                        "open_interest": 0.0
+                    })
+                else:
+                    options_rows.append({
+                        "captured_at_bkk": it["captured_at_bkk"],
+                        "symbol": sym,
+                        "series": sym[3:6],
+                        "strike": 0.0,
+                        "option_type": "C",
+                        "bid": it["bid"],
+                        "ask": it["ask"],
+                        "bid_vol": it["bid_vol"],
+                        "ask_vol": it["ask_vol"],
+                        "last": it["last"],
+                        "volume": it["volume"],
+                        "open_interest": 0.0
+                    })
+            else:
+                futures_rows.append({
+                    "captured_at_bkk": it["captured_at_bkk"],
+                    "symbol": sym,
+                    "bid": it["bid"],
+                    "ask": it["ask"],
+                    "bid_vol": it["bid_vol"],
+                    "ask_vol": it["ask_vol"],
+                    "last": it["last"],
+                    "volume": it["volume"],
+                    "open_interest": 0.0
+                })
+
+        save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
+        with self._cache_lock:
+            self.cdc_stats["flushes"] += 1
+            self.cdc_stats["rows_written"] += len(items_to_flush)
+        return len(items_to_flush)
+
+    def capture_baseline_snapshot(
+        self,
+        turso_pipeline_url: str,
+        turso_token: str,
+        checkpoint_name: str
+    ) -> Tuple[int, int]:
+        """
+        Generates 100% of the baseline snapshot directly from in-memory state.
+        Zero individual REST calls for options, staying 100% within Settrade rate limits!
+        """
+        now_bkk = datetime.now(BANGKOK_TZ)
+        ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._cache_lock:
+            cached_symbols = list(self.latest_market_state.values())
+
+        if not cached_symbols:
+            logger.warning(f"[BASELINE SNAPSHOT] No symbols in cache for checkpoint {checkpoint_name}.")
+            return 0, 0
+
+        futures_rows = []
+        options_rows = []
+        for it in cached_symbols:
+            sym = it["symbol"]
+            row = dict(it)
+            row["captured_at_bkk"] = ts_str
+            if sym.startswith("S50") and ("C" in sym[6:] or "P" in sym[6:]):
+                m = re.match(r"^S50([A-Z]\d{2})([CP])(\d+)$", sym)
+                if m:
+                    ser, o_type, k_str = m.groups()
+                    options_rows.append({
+                        "captured_at_bkk": ts_str,
+                        "symbol": sym,
+                        "series": ser,
+                        "strike": float(k_str),
+                        "option_type": o_type,
+                        "bid": row["bid"],
+                        "ask": row["ask"],
+                        "bid_vol": row.get("bid_vol", 0.0),
+                        "ask_vol": row.get("ask_vol", 0.0),
+                        "last": row.get("last"),
+                        "volume": row.get("volume", 0.0),
+                        "open_interest": 0.0
+                    })
+            else:
+                futures_rows.append({
+                    "captured_at_bkk": ts_str,
+                    "symbol": sym,
+                    "bid": row["bid"],
+                    "ask": row["ask"],
+                    "bid_vol": row.get("bid_vol", 0.0),
+                    "ask_vol": row.get("ask_vol", 0.0),
+                    "last": row.get("last"),
+                    "volume": row.get("volume", 0.0),
+                    "open_interest": 0.0
+                })
+
+        save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
+        with self._cache_lock:
+            for row in cached_symbols:
+                self.last_persisted_state[row["symbol"]] = row
+            self.cdc_stats["rows_written"] += (len(futures_rows) + len(options_rows))
+
+        logger.info(
+            f"[BASELINE SNAPSHOT] ✅ Checkpoint {checkpoint_name} captured at {ts_str}: "
+            f"{len(futures_rows)} futures, {len(options_rows)} options written to Turso."
+        )
+        return len(futures_rows), len(options_rows)
+
+    def check_watchdog_health(self) -> Tuple[bool, float]:
+        """Checks if WebSocket ticks are flowing. Returns (is_healthy, elapsed_seconds)."""
+        with self._cache_lock:
+            elapsed = pytime.time() - self.last_tick_time
+        return (elapsed <= 15.0), elapsed
 
     def get_bid_offer(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         with self._cache_lock:
@@ -1551,6 +1816,30 @@ def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: d
 # ==============================================================================
 # 9. Execution Modes: Session Worker Loop, Single Snapshot, Manual Notify
 # ==============================================================================
+def fetch_spot_snapshot(market_data: Any, timestamp_bkk_str: str) -> Optional[Dict[str, Any]]:
+    try:
+        try:
+            spot_res = market_data.get_quote_symbol("SET50")
+            spot_fields = extract_spot_data(spot_res)
+        except Exception:
+            candles = market_data.get_candlestick("SET50", interval="1m", limit=1)
+            spot_fields = {
+                "last": float(candles["close"][-1]) if candles.get("close") else None,
+                "volume": float(candles["volume"][-1]) if candles.get("volume") else 0.0,
+                "value": float(candles["value"][-1]) if candles.get("value") else 0.0,
+            }
+        return {
+            "captured_at_bkk": timestamp_bkk_str,
+            "symbol": "SET50",
+            "last": spot_fields["last"],
+            "volume": spot_fields["volume"],
+            "value": spot_fields["value"]
+        }
+    except Exception as e:
+        logger.warning(f"[SPOT] Failed to fetch SET50 Spot: {e}")
+        return None
+
+
 def run_session_worker(
     settrade_mgr: SettradeClientManager,
     turso_pipeline_url: str,
@@ -1622,37 +1911,82 @@ def run_session_worker(
         logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
         sys.exit(0)
 
-    # 5. Resolve active contracts
+    # 5. Resolve active contracts & Ensure Turso Schema
     now_bkk = datetime.now(BANGKOK_TZ)
+    ensure_database_schema(turso_pipeline_url, turso_token)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
     logger.info(f"[SESSION] Active Series: Front={front_opt_series}, Next={next_opt_series}, Futures={futures_candidates}")
 
+    # Subscribe ALL symbols across the entire board to Realtime Streaming Pool
+    all_strikes = generate_all_active_strikes(920.0)
+    all_symbols = generate_all_stream_symbols(
+        front_series=front_opt_series,
+        next_series=next_opt_series,
+        futures_candidates=futures_candidates,
+        all_strikes=all_strikes
+    )
+    logger.info(f"[SESSION] Subscribing {len(all_symbols)} symbols to Realtime Streaming Pool...")
+    settrade_mgr.subscribe_symbols(all_symbols)
+
+    stop_event = threading.Event()
+
+    # 3-Second Micro-Batch Coalescing Flush Thread
+    def cdc_flush_loop():
+        logger.info("[CDC FLUSH] Background micro-batch flush thread started (3.0s cycle).")
+        while not stop_event.is_set():
+            try:
+                flushed = settrade_mgr.flush_coalesced_buffer(turso_pipeline_url, turso_token)
+                if flushed > 0:
+                    logger.debug(f"[CDC FLUSH] Flushed {flushed} coalesced changes to Turso.")
+            except Exception as fe:
+                logger.warning(f"[CDC FLUSH] Error flushing buffer to Turso: {fe}")
+            stop_event.wait(3.0)
+        logger.info("[CDC FLUSH] Background micro-batch flush thread exiting.")
+
+    # 15-Second Active Watchdog Thread
+    def cdc_watchdog_loop():
+        logger.info("[CDC WATCHDOG] Active watchdog thread started (15.0s cycle).")
+        while not stop_event.is_set():
+            stop_event.wait(15.0)
+            if stop_event.is_set():
+                break
+            now_t = datetime.now(BANGKOK_TZ).time()
+            in_market = (time(9, 45) <= now_t <= time(12, 30)) or (time(14, 15) <= now_t <= time(16, 55))
+            if in_market:
+                is_healthy, elapsed = settrade_mgr.check_watchdog_health()
+                if not is_healthy:
+                    logger.warning(f"[WATCHDOG] ⚠️ WebSocket silence detected! No tick received for {elapsed:.1f}s during market hours.")
+                    if elapsed > 30.0:
+                        logger.error(f"[WATCHDOG] Stream stalled for {elapsed:.1f}s (>30s). Triggering auto-reconnect of Realtime Pool...")
+                        try:
+                            settrade_mgr.stop_all_realtime()
+                            settrade_mgr.ensure_authenticated()
+                            settrade_mgr.subscribe_symbols(all_symbols)
+                            logger.info("[WATCHDOG] Realtime Pool auto-reconnect complete.")
+                        except Exception as recon_err:
+                            logger.error(f"[WATCHDOG] Reconnect error: {recon_err}")
+        logger.info("[CDC WATCHDOG] Active watchdog thread exiting.")
+
+    flush_thread = threading.Thread(target=cdc_flush_loop, daemon=True, name="CDCFlushThread")
+    watchdog_thread = threading.Thread(target=cdc_watchdog_loop, daemon=True, name="CDCWatchdogThread")
+    flush_thread.start()
+    watchdog_thread.start()
+
     market_verified = False
-    if not force and now_bkk.time() >= verify_holiday_time:
-        check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, now_bkk)
-        market_verified = True
-
-    total_collected_bars = 0
     session_error_count = 0
+    triggered_baselines: Set[str] = set()
+    last_spot_minute = -1
 
-    # 6. Session Worker Loop (1-minute drift-free exact loop)
+    # 6. Session Worker Loop (1-second precision loop)
+    logger.info(f"--- [CDC LOOP] Realtime Event Capture Loop Engaged (Session: {session_name}) ---")
     while True:
         loop_now = datetime.now(BANGKOK_TZ)
+        loop_time = loop_now.time()
 
         # Check graceful exit condition
-        if not force and loop_now.time() >= session_end_time:
+        if not force and loop_time >= session_end_time:
             logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
             break
-
-        ts_str = loop_now.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"--- [TICK] Minute Bar Capture: {ts_str} (Session: {session_name}) ---")
-
-        # Concurrency check on first tick before calling Market Data API
-        if total_collected_bars == 0 and not force:
-            if is_worker_already_active(turso_pipeline_url, turso_token, loop_now):
-                print("Another worker is already active. Exiting cleanly.")
-                logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
-                sys.exit(0)
 
         # Proactive token re-auth check
         try:
@@ -1660,77 +1994,80 @@ def run_session_worker(
         except Exception as e:
             logger.warning(f"[SETTRADE] Proactive auth refresh warning: {e}")
 
-        # Capture snapshot & write to Turso (Fault tolerant)
-        try:
-            spot_c, fut_c, opt_c = collect_and_save_snapshot(
-                market_data=settrade_mgr.market_data,
-                turso_pipeline_url=turso_pipeline_url,
-                turso_token=turso_token,
-                workers=workers,
-                max_rps=max_rps,
-                timestamp_bkk_str=ts_str,
-                now_bkk=loop_now,
-                front_opt_series=front_opt_series,
-                next_opt_series=next_opt_series,
-                futures_candidates=futures_candidates,
-                settrade_mgr=settrade_mgr
-            )
-            if spot_c > 0 or fut_c > 0 or opt_c > 0:
-                total_collected_bars += 1
-        except Exception as e:
-            session_error_count += 1
-            logger.warning(f"[TICK ERROR] Data collection or Turso write failed at {ts_str} (Session Error #{session_error_count}): {e}")
+        # 1-minute Spot capture (:00 second of every minute)
+        if loop_now.minute != last_spot_minute and loop_now.second >= 0:
+            last_spot_minute = loop_now.minute
+            ts_str = loop_now.strftime("%Y-%m-%d %H:%M:%S")
             try:
-                record_intraday_tick_error(
-                    pipeline_url=turso_pipeline_url,
-                    auth_token=turso_token,
-                    trade_date=loop_now.strftime("%Y-%m-%d"),
-                    captured_at=ts_str,
-                    session_name=session_name,
-                    error_type=type(e).__name__,
-                    error_msg=str(e)
-                )
-            except Exception as rec_err:
-                logger.warning(f"Could not record tick error to Turso: {rec_err}")
+                spot_row = fetch_spot_snapshot(settrade_mgr.market_data, ts_str)
+                if spot_row:
+                    save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows=[], options_rows=[], spot_rows=[spot_row])
+            except Exception as spot_err:
+                session_error_count += 1
+                logger.warning(f"[SPOT ERROR] Could not save SET50 Spot at {ts_str}: {spot_err}")
 
-            err_str = str(e).lower()
-            if "auth" in err_str or "token" in err_str or "unauthorized" in err_str or "401" in err_str:
+        # Baseline Snapshot Trigger (09:45, 12:30, 14:15, 16:55 + 30-min heartbeats)
+        h, m = loop_time.hour, loop_time.minute
+        ts_minute_key = f"{loop_now.strftime('%Y%m%d')}_{h:02d}{m:02d}"
+        if ts_minute_key not in triggered_baselines:
+            checkpoint_name = None
+            if h == 9 and m == 45:
+                checkpoint_name = "09:45_MORNING_OPEN"
+            elif h == 12 and m == 30:
+                checkpoint_name = "12:30_MIDDAY_CLOSE"
+            elif h == 14 and m == 15:
+                checkpoint_name = "14:15_AFTERNOON_OPEN"
+            elif h == 16 and m == 55:
+                checkpoint_name = "16:55_EVENING_CLOSE"
+            elif m in (15, 45):
+                in_market = (time(9, 45) <= loop_time <= time(12, 30)) or (time(14, 15) <= loop_time <= time(16, 55))
+                if in_market:
+                    checkpoint_name = f"{h:02d}:{m:02d}_HEARTBEAT_30M"
+
+            if checkpoint_name:
+                triggered_baselines.add(ts_minute_key)
                 try:
-                    settrade_mgr.handle_auth_failure()
-                except Exception as reauth_err:
-                    logger.error(f"[SETTRADE] Re-authentication failed: {reauth_err}")
+                    f_c, o_c = settrade_mgr.capture_baseline_snapshot(
+                        turso_pipeline_url, turso_token, checkpoint_name
+                    )
+                    logger.info(f"[BASELINE] Saved baseline {checkpoint_name}: {f_c} fut, {o_c} opt.")
+                except Exception as b_err:
+                    session_error_count += 1
+                    logger.error(f"[BASELINE ERROR] Failed to save baseline snapshot {checkpoint_name}: {b_err}")
 
         # 10-minute Holiday / Inactive market check
-        if not market_verified and not force and datetime.now(BANGKOK_TZ).time() >= verify_holiday_time:
-            check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, datetime.now(BANGKOK_TZ))
+        if not market_verified and not force and loop_time >= verify_holiday_time:
+            check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, loop_now)
             market_verified = True
 
-        # Telegram 4-checkpoint alerts evaluation
+        # Telegram 4-checkpoint alerts evaluation (10:00, 12:30, 14:30, 17:00)
         if telegram_bot_token and telegram_chat_id:
             try:
                 check_and_send_checkpoints(
-                    datetime.now(BANGKOK_TZ), turso_pipeline_url, turso_token,
+                    loop_now, turso_pipeline_url, turso_token,
                     telegram_bot_token, telegram_chat_id, force_notify=False,
-                    session_errors=session_error_count
+                    session_errors=session_error_count,
+                    cdc_stats=settrade_mgr.cdc_stats
                 )
             except Exception as e:
                 logger.warning(f"[TELEGRAM] Checkpoint alert error: {e}")
 
-        # Check if session has ended right now after work
-        finish_now = datetime.now(BANGKOK_TZ)
-        if not force and finish_now.time() >= session_end_time:
-            logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
-            break
+        # Sleep until next second
+        pytime.sleep(1.0)
 
-        # Precise drift-free sleep until next :00 second
-        next_minute_target = (finish_now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        sleep_duration = (next_minute_target - datetime.now(BANGKOK_TZ)).total_seconds()
-        if sleep_duration > 0:
-            pytime.sleep(sleep_duration)
+    # Teardown
+    stop_event.set()
+    flush_thread.join(timeout=5.0)
+    watchdog_thread.join(timeout=5.0)
+    try:
+        settrade_mgr.flush_coalesced_buffer(turso_pipeline_url, turso_token)
+    except Exception as fe:
+        logger.warning(f"[TEARDOWN] Final flush error: {fe}")
+    settrade_mgr.stop_all_realtime()
 
     logger.info(
         f"=== Session Worker Completed Successfully: {session_name} ===\n"
-        f"Total bars collected in session: {total_collected_bars} bars.\n"
+        f"CDC Stats: {settrade_mgr.cdc_stats}\n"
         f"Exit time: {datetime.now(BANGKOK_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
     )
     sys.exit(0)
