@@ -193,6 +193,38 @@ class TestCDCCollector(unittest.TestCase):
         self.assertIn("38,000", msg)
         self.assertIn("76.0% reduction", msg)
 
+    def test_clear_session_cache(self):
+        mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
+        mgr.latest_market_state["S50Z26"] = {"symbol": "S50Z26", "bid": 920.0}
+        mgr.last_persisted_state["S50Z26"] = {"symbol": "S50Z26", "bid": 920.0}
+        mgr.coalesced_buffer["S50Z26"] = {"symbol": "S50Z26", "bid": 920.0}
+        mgr.bid_offer_cache["S50Z26"] = {"symbol": "S50Z26"}
+
+        mgr.clear_session_cache()
+        self.assertEqual(len(mgr.latest_market_state), 0)
+        self.assertEqual(len(mgr.last_persisted_state), 0)
+        self.assertEqual(len(mgr.coalesced_buffer), 0)
+        self.assertEqual(len(mgr.bid_offer_cache), 0)
+
+    @patch("collector.save_cdc_batch_to_turso")
+    def test_open_interest_is_none_in_baseline(self, mock_save):
+        mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
+        mgr.latest_market_state["S50Z26"] = {
+            "symbol": "S50Z26",
+            "bid": 920.0, "ask": 920.5, "bid_vol": 10.0, "ask_vol": 20.0,
+            "last": 920.2, "volume": 100.0, "captured_at_bkk": "2026-11-19 09:45:00"
+        }
+        mgr.latest_market_state["S50Z26C900"] = {
+            "symbol": "S50Z26C900",
+            "bid": 22.0, "ask": 22.5, "bid_vol": 5.0, "ask_vol": 10.0,
+            "last": 22.2, "volume": 50.0, "captured_at_bkk": "2026-11-19 09:45:00"
+        }
+        mgr.capture_baseline_snapshot("https://dummy", "token", "09:45_MORNING_OPEN")
+        self.assertTrue(mock_save.called)
+        _, _, fut_rows, opt_rows = mock_save.call_args[0][:4]
+        self.assertIsNone(fut_rows[0]["open_interest"])
+        self.assertIsNone(opt_rows[0]["open_interest"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -340,7 +340,7 @@ def extract_derivatives_data(raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
         "ask": safe_float(ask),
         "last": safe_float(last),
         "volume": safe_float(vol) or 0.0,
-        "open_interest": safe_float(oi) or 0.0
+        "open_interest": safe_float(oi) if oi is not None else None
     }
 
 
@@ -1134,6 +1134,37 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
         return False
 
 
+_last_critical_alert_time: float = 0.0
+_critical_alert_lock = threading.Lock()
+
+def send_critical_error_alert(
+    telegram_bot_token: str,
+    telegram_chat_id: str,
+    error_title: str,
+    error_detail: str,
+    cooldown_seconds: int = 900
+) -> bool:
+    global _last_critical_alert_time
+    if not telegram_bot_token or not telegram_chat_id:
+        return False
+    with _critical_alert_lock:
+        now_time = pytime.time()
+        if now_time - _last_critical_alert_time < cooldown_seconds:
+            logger.info(f"[CRITICAL ALERT] Suppressed by rate limit cooldown ({now_time - _last_critical_alert_time:.0f}s < {cooldown_seconds}s).")
+            return False
+        _last_critical_alert_time = now_time
+
+    now_bkk_str = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"🚨 <b>TFEX INTRADAY COLLECTOR: CRITICAL FAILURE ALERT</b>\n\n"
+        f"• <b>Error:</b> ❌ {error_title}\n"
+        f"• <b>Details:</b> <code>{error_detail}</code>\n"
+        f"• <b>Timestamp:</b> <code>{now_bkk_str}</code>\n"
+        f"• <b>Action:</b> กรุณาตรวจสอบสถานะ Turso Database และ Settrade Open API ด่วน"
+    )
+    return send_telegram_message(telegram_bot_token, telegram_chat_id, msg)
+
+
 def check_and_send_checkpoints(
     now_bkk: datetime,
     pipeline_url: str,
@@ -1244,6 +1275,18 @@ class SettradeClientManager:
             "flushes": 0,
             "rows_written": 0
         }
+
+    def clear_session_cache(self) -> None:
+        """
+        Clears all in-memory CDC caches between sessions to prevent stale ticks
+        from carrying over into new session baseline snapshots.
+        """
+        with self._cache_lock:
+            self.latest_market_state.clear()
+            self.last_persisted_state.clear()
+            self.coalesced_buffer.clear()
+            self.bid_offer_cache.clear()
+            logger.info("[CDC] Session caches cleared (latest_market_state, last_persisted_state, coalesced_buffer).")
 
     def stop_all_realtime(self) -> None:
         """Safely stops and disconnects all MQTT WebSocket connections in the pool."""
@@ -1410,7 +1453,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": 0.0
+                        "open_interest": None
                     })
                 else:
                     options_rows.append({
@@ -1425,7 +1468,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": 0.0
+                        "open_interest": None
                     })
             else:
                 futures_rows.append({
@@ -1437,7 +1480,7 @@ class SettradeClientManager:
                     "ask_vol": it["ask_vol"],
                     "last": it["last"],
                     "volume": it["volume"],
-                    "open_interest": 0.0
+                    "open_interest": None
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1488,7 +1531,7 @@ class SettradeClientManager:
                         "ask_vol": row.get("ask_vol", 0.0),
                         "last": row.get("last"),
                         "volume": row.get("volume", 0.0),
-                        "open_interest": 0.0
+                        "open_interest": None
                     })
             else:
                 futures_rows.append({
@@ -1500,7 +1543,7 @@ class SettradeClientManager:
                     "ask_vol": row.get("ask_vol", 0.0),
                     "last": row.get("last"),
                     "volume": row.get("volume", 0.0),
-                    "open_interest": 0.0
+                    "open_interest": None
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1900,6 +1943,9 @@ def run_session_worker(
     logger.info(f"=== Starting TFEX Persistent Session Worker: {session_name} ===")
     logger.info(f"Market Open: {market_open_time.strftime('%H:%M:%S')} | Session End: {session_end_time.strftime('%H:%M:%S')}")
 
+    # Clear in-memory caches from previous sessions
+    settrade_mgr.clear_session_cache()
+
     # 3. Connect to Settrade Open API
     try:
         settrade_mgr.connect()
@@ -1910,6 +1956,7 @@ def run_session_worker(
     # 4. Pre-Market Wait if awakened before open time
     if not force and now_bkk.time() < market_open_time:
         wait_for_market_open(market_open_time, session_name)
+        settrade_mgr.clear_session_cache()
 
     # Re-check Concurrency Guard after market open standby
     now_bkk = datetime.now(BANGKOK_TZ)
@@ -1940,13 +1987,23 @@ def run_session_worker(
     # 3-Second Micro-Batch Coalescing Flush Thread
     def cdc_flush_loop():
         logger.info("[CDC FLUSH] Background micro-batch flush thread started (3.0s cycle).")
+        consecutive_errors = 0
         while not stop_event.is_set():
             try:
                 flushed = settrade_mgr.flush_coalesced_buffer(turso_pipeline_url, turso_token)
+                consecutive_errors = 0
                 if flushed > 0:
                     logger.debug(f"[CDC FLUSH] Flushed {flushed} coalesced changes to Turso.")
             except Exception as fe:
-                logger.warning(f"[CDC FLUSH] Error flushing buffer to Turso: {fe}")
+                consecutive_errors += 1
+                logger.warning(f"[CDC FLUSH] Error flushing buffer to Turso (attempt {consecutive_errors}): {fe}")
+                if consecutive_errors >= 3:
+                    send_critical_error_alert(
+                        telegram_bot_token,
+                        telegram_chat_id,
+                        error_title="Turso CDC Batch Flush Failed 3+ Consecutive Times",
+                        error_detail=str(fe)
+                    )
             stop_event.wait(3.0)
         logger.info("[CDC FLUSH] Background micro-batch flush thread exiting.")
 
@@ -1972,6 +2029,12 @@ def run_session_worker(
                             logger.info("[WATCHDOG] Realtime Pool auto-reconnect complete.")
                         except Exception as recon_err:
                             logger.error(f"[WATCHDOG] Reconnect error: {recon_err}")
+                            send_critical_error_alert(
+                                telegram_bot_token,
+                                telegram_chat_id,
+                                error_title="Settrade WebSocket Watchdog Auto-Reconnect Failed",
+                                error_detail=str(recon_err)
+                            )
         logger.info("[CDC WATCHDOG] Active watchdog thread exiting.")
 
     flush_thread = threading.Thread(target=cdc_flush_loop, daemon=True, name="CDCFlushThread")
