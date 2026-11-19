@@ -1818,10 +1818,17 @@ def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: d
 # ==============================================================================
 def fetch_spot_snapshot(market_data: Any, timestamp_bkk_str: str) -> Optional[Dict[str, Any]]:
     try:
+        spot_fields = None
         try:
             spot_res = market_data.get_quote_symbol("SET50")
-            spot_fields = extract_spot_data(spot_res)
+            if spot_res:
+                extracted = extract_spot_data(spot_res)
+                if extracted.get("last") is not None:
+                    spot_fields = extracted
         except Exception:
+            pass
+
+        if spot_fields is None:
             candles = market_data.get_candlestick("SET50", interval="1m", limit=1)
             spot_fields = {
                 "last": float(candles["close"][-1]) if candles.get("close") else None,
