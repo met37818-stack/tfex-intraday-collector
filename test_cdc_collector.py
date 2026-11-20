@@ -535,3 +535,48 @@ class TestSqlParameterisation(unittest.TestCase):
         stmt = mock_query.call_args[0][2][0]["stmt"]
         self.assertNotIn(self.DATE, stmt["sql"])
         self.assertEqual(stmt["args"][0], {"type": "text", "value": f"{self.DATE}%"})
+
+
+class TestTelegramTokenHygiene(unittest.TestCase):
+    """The bot token lives in the request URL; it must never reach a log line."""
+
+    def test_transport_error_does_not_log_the_token(self):
+        import requests
+        from collector import send_telegram_message
+
+        token = "123456789:AAFakeIntradayTokenMustNotLeak"
+        boom = requests.ConnectionError(
+            f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded with url: /bot{token}/sendMessage"
+        )
+
+        class FakeSession:
+            def post(self, *a, **kw):
+                raise boom
+
+        with patch("collector._http_session", return_value=FakeSession()):
+            with self.assertLogs("tfex_collector", level="ERROR") as logs:
+                ok = send_telegram_message(token, "1", "hello")
+
+        self.assertFalse(ok)
+        joined = " ".join(logs.output)
+        self.assertNotIn(token, joined, "bot token leaked into logs")
+        self.assertIn("ConnectionError", joined)
+
+
+class TestMarketInactiveExitCode(unittest.TestCase):
+    """An inactive market must not exit 0 (cron would call it a success)."""
+
+    def test_no_candles_today_exits_nonzero(self):
+        from datetime import date, timedelta
+        from collector import check_holiday_early_exit
+
+        yesterday = datetime.now(BANGKOK_TZ).date() - timedelta(days=1)
+        stale_epoch = int(datetime(yesterday.year, yesterday.month, yesterday.day, 15, 0, tzinfo=BANGKOK_TZ).timestamp())
+
+        class FakeMarketData:
+            def get_candlestick(self, symbol, interval="1m", limit=1):
+                return {"time": [stale_epoch], "close": [900.0]}
+
+        with self.assertRaises(SystemExit) as ctx:
+            check_holiday_early_exit(FakeMarketData(), "Z26", datetime.now(BANGKOK_TZ))
+        self.assertEqual(ctx.exception.code, 3)

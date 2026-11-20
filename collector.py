@@ -1185,15 +1185,17 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
     }
     try:
         resp = _http_session().post(url, json=payload, timeout=15)
-        logger.info(f"[TELEGRAM] HTTP Status: {resp.status_code} | API Response: {resp.text}")
         if resp.status_code == 200 and resp.json().get("ok"):
-            logger.info("Telegram alert sent successfully.")
+            logger.info(f"[TELEGRAM] Delivered successfully (HTTP {resp.status_code}).")
             return True
-        else:
-            logger.error(f"Telegram API returned status {resp.status_code}: {resp.text}")
-            return False
-    except Exception as e:
-        logger.error(f"Failed to deliver Telegram message: {e}")
+        # The response body is a Telegram error envelope; the URL (which carries
+        # the bot token) is never logged.
+        logger.error(f"[TELEGRAM] API rejected the message (HTTP {resp.status_code}): {(resp.text or '')[:200]}")
+        return False
+    except requests.RequestException as exc:
+        # requests embeds the full URL — including /bot<token>/ — in its own
+        # exception messages, so only the exception type is logged.
+        logger.error(f"[TELEGRAM] Delivery failed: {type(exc).__name__}")
         return False
 
 
@@ -1916,12 +1918,16 @@ def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: d
                     pass
 
                 if not spot_has_today:
-                    logger.info(
-                        f"[GUARD] Holiday / Inactive Market Detected: 10 minutes past market open ({now_bkk.strftime('%H:%M:%S')}). "
-                        f"Latest candlestick date for {front_fut_symbol} is {candle_dt.date()} (< {today_date}). "
-                        f"No market trades recorded today. Exiting session worker gracefully (sys.exit(0))."
+                    # Exit 3, not 0: the calendar already ruled out a scheduled
+                    # holiday, so "no trades today" is either an unscheduled
+                    # closure or a data outage. Both need a human to look, and a
+                    # zero exit reported the run as successful either way.
+                    logger.error(
+                        f"[GUARD] Market inactive 10 minutes after open ({now_bkk.strftime('%H:%M:%S')}): "
+                        f"latest candle for {front_fut_symbol} is {candle_dt.date()} (< {today_date}) and "
+                        f"SET50 has no candle today. Exiting with code 3 (unscheduled closure or data outage)."
                     )
-                    sys.exit(0)
+                    sys.exit(3)
 
             logger.info(
                 f"[GUARD] Live market verified: Latest 1m candle for {front_fut_symbol} is "
