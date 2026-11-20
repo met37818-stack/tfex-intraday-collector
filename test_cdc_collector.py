@@ -544,26 +544,32 @@ class TestTelegramTokenHygiene(unittest.TestCase):
     """The bot token lives in the request URL; it must never reach a log line."""
 
     def test_transport_error_does_not_log_the_token(self):
+        """
+        Dispatch now goes through tfex_common.telegram, which logs only the exception
+        class name (the request URL carries the bot token) and returns False instead
+        of raising. The log line is a stdout print, not the collector logger.
+        """
+        import io
         import requests
+        from contextlib import redirect_stdout
+        from unittest.mock import patch as _patch
+
+        import tfex_common.telegram as tg
         from collector import send_telegram_message
 
-        token = "123456789:AAFakeIntradayTokenMustNotLeak"
+        token = "123456789:***"
         boom = requests.ConnectionError(
             f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded with url: /bot{token}/sendMessage"
         )
 
-        class FakeSession:
-            def post(self, *a, **kw):
-                raise boom
-
-        with patch("collector._http_session", return_value=FakeSession()):
-            with self.assertLogs("tfex_collector", level="ERROR") as logs:
-                ok = send_telegram_message(token, "1", "hello")
+        buf = io.StringIO()
+        with _patch.object(tg.requests, "post", side_effect=boom), redirect_stdout(buf):
+            ok = send_telegram_message(token, "1", "hello")
 
         self.assertFalse(ok)
-        joined = " ".join(logs.output)
-        self.assertNotIn(token, joined, "bot token leaked into logs")
-        self.assertIn("ConnectionError", joined)
+        out = buf.getvalue()
+        self.assertNotIn(token, out, "bot token leaked into logs")
+        self.assertIn("ConnectionError", out)
 
 
 class TestMarketInactiveExitCode(unittest.TestCase):

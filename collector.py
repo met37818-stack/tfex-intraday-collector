@@ -16,7 +16,6 @@ import sys
 import re
 import time as pytime
 import argparse
-import calendar
 import logging
 import threading
 from datetime import datetime, time, date, timedelta
@@ -58,60 +57,20 @@ STRIKE_MAX = 1350
 STRIKE_ATM_RANGE = 250
 DEFAULT_ATM_BASE = 920.0
 
-# TFEX Month code mapping
-MONTH_CODES = {
-    1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
-    7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"
-}
-QUARTERLY_MONTHS = {3, 6, 9, 12}  # H, M, U, Z
+# Shared calendar helpers (tfex_common, pinned to a tag in requirements.txt).
+from tfex_common.calendar import (  # noqa: E402
+    SET_HOLIDAYS,
+    get_contract_last_trading_day,
+    get_penultimate_business_day,
+    resolve_active_series_candidates,
+)
+# Telegram dispatch is shared too. BANGKOK_TZ stays local: it is a pytz zone used
+# with .localize() in 20+ places, which the package's fixed-offset tzinfo lacks.
+from tfex_common.telegram import send_alert  # noqa: E402
 
-# ==============================================================================
-# SET / TFEX Official Exchange Holidays (2026 - 2027)
-# NOTE: keep in sync with tfex-eod-collector/calendar_utils.py. The two repos must
-# agree on this set, or one collects on a day the other skips.
-# ==============================================================================
-SET_HOLIDAYS = {
-    # 2026
-    "2026-01-01",  # New Year's Day
-    "2026-01-02",  # Special Holiday
-    "2026-03-03",  # Makha Bucha Day
-    "2026-04-06",  # Chakri Memorial Day
-    "2026-04-13",  # Songkran Festival
-    "2026-04-14",  # Songkran Festival
-    "2026-04-15",  # Songkran Festival
-    "2026-05-01",  # National Labour Day
-    "2026-05-04",  # Coronation Day
-    "2026-06-01",  # Substitution for Visakha Bucha Day (Sun May 31)
-    "2026-06-03",  # H.M. Queen Suthida's Birthday
-    "2026-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2026-07-29",  # Asahna Bucha Day
-    "2026-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday / Mother's Day
-    "2026-10-13",  # King Bhumibol Adulyadej Memorial Day (Navamindra Maharaj Day)
-    "2026-10-16",  # Special Holiday
-    "2026-10-23",  # Chulalongkorn Day
-    "2026-12-07",  # Substitution for King Bhumibol's Birthday / Father's Day (Sat Dec 5)
-    "2026-12-10",  # Constitution Day
-    "2026-12-31",  # New Year's Eve
-    # 2027
-    "2027-01-01",  # New Year's Day
-    "2027-02-22",  # Substitution for Makha Bucha Day (Sun Feb 21)
-    "2027-04-06",  # Chakri Memorial Day
-    "2027-04-13",  # Songkran Festival
-    "2027-04-14",  # Songkran Festival
-    "2027-04-15",  # Songkran Festival
-    "2027-05-03",  # Substitution for National Labour Day (Sat May 1)
-    "2027-05-04",  # Coronation Day
-    "2027-05-20",  # Visakha Bucha Day
-    "2027-06-03",  # H.M. Queen Suthida's Birthday
-    "2027-07-19",  # Substitution for Asahna Bucha Day (Sun Jul 18)
-    "2027-07-28",  # H.M. King Maha Vajiralongkorn's Birthday
-    "2027-08-12",  # H.M. Queen Sirikit The Queen Mother's Birthday / Mother's Day
-    "2027-10-13",  # King Bhumibol Adulyadej Memorial Day
-    "2027-10-25",  # Substitution for Chulalongkorn Day (Sat Oct 23)
-    "2027-12-06",  # Substitution for King Bhumibol's Birthday / Father's Day (Sun Dec 5)
-    "2027-12-10",  # Constitution Day
-    "2027-12-31",  # New Year's Eve
-}
+
+# The SET holiday table now comes from tfex_common.calendar, so this repo can no
+# longer disagree with the EOD collector about whether a day is a trading session.
 
 # Session schedule definitions (Asia/Bangkok)
 SESSION_CONFIG = {
@@ -259,54 +218,10 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
 # ==============================================================================
 # 2. Dynamic TFEX Contract Resolution (Rollover Proof)
 # ==============================================================================
-def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> date:
-    """
-    Calculate the penultimate business day of a given month.
-    (TFEX contract specification for SET50 Futures & Options expiration).
-    """
-    _, last_day = calendar.monthrange(year, month)
-    biz_days = [
-        date(year, month, d)
-        for d in range(1, last_day + 1)
-        if date(year, month, d).weekday() < 5 and date(year, month, d).strftime("%Y-%m-%d") not in holidays
-    ]
-    if len(biz_days) < 2:
-        return biz_days[-1] if biz_days else date(year, month, last_day)
-    return biz_days[-2]
 
 
-def get_contract_last_trading_day(year: int, month: int) -> datetime:
-    """
-    Calculates TFEX contract last trading day:
-    The business day immediately preceding the last business day of the contract month (Penultimate Business Day).
-    Trading ceases at 16:30 hrs.
-    """
-    ltd = get_penultimate_business_day(year, month, SET_HOLIDAYS)
-    return BANGKOK_TZ.localize(datetime(ltd.year, ltd.month, ltd.day, 16, 30, 0))
 
 
-def resolve_active_series_candidates(now_bkk: datetime) -> Tuple[List[str], str, str]:
-    """
-    Automatically discovers candidate active quarterly contract months (H, M, U, Z) without hardcoding.
-    Returns:
-    - candidate_futures_series: List of 4 active quarterly futures series (e.g. ['Z26', 'H27', 'M27', 'U27'])
-    - front_options_series: Nearest active quarterly options series (e.g. 'Z26')
-    - next_options_series: Following active quarterly options series (e.g. 'H27')
-    """
-    active_quarterlies: List[str] = []
-    for yr in range(now_bkk.year, now_bkk.year + 3):
-        for qm in [3, 6, 9, 12]:
-            q_ltd = get_contract_last_trading_day(yr, qm)
-            if now_bkk <= q_ltd:
-                code = MONTH_CODES[qm]
-                yr_short = str(yr)[-2:]
-                active_quarterlies.append(f"{code}{yr_short}")
-
-    candidate_futures_series = active_quarterlies[:4]
-    front_opt_series = active_quarterlies[0]
-    next_opt_series = active_quarterlies[1]
-
-    return candidate_futures_series, front_opt_series, next_opt_series
 
 
 def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
@@ -1176,50 +1091,17 @@ def build_checkpoint_message(
     return f"{header}\n\n{body}{cdc_sec}"
 
 
-def escape_telegram_html(text: str) -> str:
-    """
-    Escapes raw <, >, and & characters for Telegram HTML parse_mode
-    while preserving supported Telegram tags (<b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>, <a>, </a>).
-    """
-    pattern = r"</?(?:b|i|code|pre|a)(?:\s+[^>]+)?>"
-    placeholder_map = {}
-
-    def repl_tag(m):
-        tok = f"___TAG_HOLD_{len(placeholder_map)}___"
-        placeholder_map[tok] = m.group(0)
-        return tok
-
-    tokenized = re.sub(pattern, repl_tag, text, flags=re.IGNORECASE)
-    tokenized = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", tokenized)
-    tokenized = tokenized.replace("<", "&lt;").replace(">", "&gt;")
-    for tok, orig in placeholder_map.items():
-        tokenized = tokenized.replace(tok, orig)
-
-    return tokenized
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": escape_telegram_html(message),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        resp = _http_session().post(url, json=payload, timeout=15)
-        if resp.status_code == 200 and resp.json().get("ok"):
-            logger.info(f"[TELEGRAM] Delivered successfully (HTTP {resp.status_code}).")
-            return True
-        # The response body is a Telegram error envelope; the URL (which carries
-        # the bot token) is never logged.
-        logger.error(f"[TELEGRAM] API rejected the message (HTTP {resp.status_code}): {(resp.text or '')[:200]}")
-        return False
-    except requests.RequestException as exc:
-        # requests embeds the full URL — including /bot<token>/ — in its own
-        # exception messages, so only the exception type is logged.
-        logger.error(f"[TELEGRAM] Delivery failed: {type(exc).__name__}")
-        return False
+    """
+    Escapes the HTML then dispatches through tfex_common.telegram.send_alert().
+
+    The escaping and the token-safe error handling live in the package (shared with
+    the other three repos); this adapter keeps the local call sites and the
+    escape=True semantics this collector has always used.
+    """
+    return send_alert(bot_token, chat_id, message, escape=True, timeout=15)
 
 
 _last_critical_alert_time: float = 0.0
