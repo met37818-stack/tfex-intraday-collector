@@ -221,22 +221,29 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
 # ==============================================================================
 # 2. Dynamic TFEX Contract Resolution (Rollover Proof)
 # ==============================================================================
-def get_contract_last_trading_day(year: int, month: int) -> datetime:
+def get_penultimate_business_day(year: int, month: int, holidays: set = SET_HOLIDAYS) -> date:
     """
-    Calculates TFEX contract last trading day:
-    The business day immediately preceding the last business day of the contract month.
-    Trading ceases at 16:30 hrs.
+    Calculate the penultimate business day of a given month.
+    (TFEX contract specification for SET50 Futures & Options expiration).
     """
     _, last_day = calendar.monthrange(year, month)
     biz_days = [
         date(year, month, d)
         for d in range(1, last_day + 1)
-        if date(year, month, d).weekday() < 5
+        if date(year, month, d).weekday() < 5 and date(year, month, d).strftime("%Y-%m-%d") not in holidays
     ]
-    if len(biz_days) >= 2:
-        ltd = biz_days[-2]
-    else:
-        ltd = biz_days[-1]
+    if len(biz_days) < 2:
+        return biz_days[-1] if biz_days else date(year, month, last_day)
+    return biz_days[-2]
+
+
+def get_contract_last_trading_day(year: int, month: int) -> datetime:
+    """
+    Calculates TFEX contract last trading day:
+    The business day immediately preceding the last business day of the contract month (Penultimate Business Day).
+    Trading ceases at 16:30 hrs.
+    """
+    ltd = get_penultimate_business_day(year, month, SET_HOLIDAYS)
     return BANGKOK_TZ.localize(datetime(ltd.year, ltd.month, ltd.day, 16, 30, 0))
 
 

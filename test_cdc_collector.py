@@ -23,7 +23,9 @@ from collector import (
     detect_session_window,
     is_within_trading_hours,
     SESSION_CONFIG,
-    BANGKOK_TZ
+    BANGKOK_TZ,
+    get_penultimate_business_day,
+    get_contract_last_trading_day
 )
 
 
@@ -410,6 +412,14 @@ class TestCDCCollector(unittest.TestCase):
         stats_300 = dict(base_stats, spot_count=300)
         msg_300 = build_checkpoint_message("EVENING_CLOSE", "2026-11-20", now_bkk, stats_300)
         self.assertIn("Integrity Verdict:</b> 🚨 Incomplete (300/355 bars)", msg_300)
+
+    def test_get_penultimate_business_day_with_holidays(self):
+        # In Dec 2026: Dec 31 is holiday. Business days end on Dec 30 (last) and Dec 29 (penultimate).
+        p_day = get_penultimate_business_day(2026, 12)
+        self.assertEqual(p_day.strftime("%Y-%m-%d"), "2026-12-29")
+
+        ltd = get_contract_last_trading_day(2026, 12)
+        self.assertEqual(ltd.strftime("%Y-%m-%d %H:%M:%S"), "2026-12-29 16:30:00")
 
 
 if __name__ == "__main__":
