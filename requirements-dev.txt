@@ -1,0 +1,5 @@
+# Development / test dependencies. Not installed by the GitHub Actions workflow.
+# test_cdc_collector.py needs pytest; without this file a fresh clone could not run
+# the suite at all (there was no requirements-dev.txt before 2026-11-21).
+-r requirements.txt
+pytest==9.2.0
