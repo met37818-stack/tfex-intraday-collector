@@ -10,7 +10,7 @@ on:
           - session
           - once
           - notify
-          - clean
+          
         required: true
         default: session
       force:
