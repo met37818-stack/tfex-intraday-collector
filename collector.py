@@ -67,6 +67,9 @@ from tfex_common.calendar import (  # noqa: E402
 # Telegram dispatch is shared too. BANGKOK_TZ stays local: it is a pytz zone used
 # with .localize() in 20+ places, which the package's fixed-offset tzinfo lacks.
 from tfex_common.telegram import send_alert  # noqa: E402
+from tfex_common.turso import execute_pipeline  # noqa: E402
+from tfex_common.turso import normalize_url as normalize_turso_pipeline_url  # noqa: E402
+from tfex_common.turso import to_arg as to_turso_arg  # noqa: E402
 
 
 # The SET holiday table now comes from tfex_common.calendar, so this repo can no
@@ -220,10 +223,6 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
 # ==============================================================================
 
 
-
-
-
-
 def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
     """
     Generates all active strike prices covering the entire TFEX trading board.
@@ -313,31 +312,6 @@ def extract_derivatives_data(raw: Dict[str, Any]) -> Dict[str, Optional[float]]:
 # ==============================================================================
 # 4. Turso Cloud SQLite HTTP Pipeline API (/v2/pipeline)
 # ==============================================================================
-def normalize_turso_pipeline_url(db_url: str) -> str:
-    url = db_url.strip()
-    if url.startswith("libsql://"):
-        url = "https://" + url[9:]
-    elif not url.startswith("http://") and not url.startswith("https://"):
-        url = "https://" + url
-
-    url = url.rstrip("/")
-    if not url.endswith("/v2/pipeline"):
-        url = f"{url}/v2/pipeline"
-    return url
-
-
-def to_turso_arg(val: Any) -> Dict[str, Any]:
-    if val is None:
-        return {"type": "null"}
-    if isinstance(val, bool):
-        return {"type": "integer", "value": "1" if val else "0"}
-    if isinstance(val, int):
-        return {"type": "integer", "value": str(val)}
-    if isinstance(val, float):
-        if val != val or val in (float("inf"), float("-inf")):  # NaN / Inf
-            return {"type": "null"}
-        return {"type": "float", "value": val}
-    return {"type": "text", "value": str(val)}
 
 
 # ==============================================================================
@@ -477,33 +451,21 @@ def build_turso_pipeline_payload(
 
 
 def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str, Any]) -> None:
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
+    """
+    Batch write adapter over tfex_common.turso.execute_pipeline().
 
+    The transport (retry on network/429/5xx, token redaction, statement-error
+    detection) lives in the package; this keeps the local logging and the
+    "returns None / raises" contract the CDC writer expects.
+    """
     try:
-        response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=30)
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Turso network connection failed: {e}")
+        execute_pipeline(pipeline_url, auth_token, payload=payload, timeout=30)
+    except requests.RequestException as exc:
+        logger.error(f"Turso network connection failed: {type(exc).__name__}")
         raise
-
-    if response.status_code != 200:
-        sanitized_msg = response.text.replace(auth_token, "***")
-        logger.error(f"Turso API returned HTTP status {response.status_code}: {sanitized_msg}")
-        raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized_msg}")
-
-    data = response.json()
-    results = data.get("results", [])
-    errors = [
-        item.get("error", {}).get("message", "Unknown statement error")
-        for item in results
-        if item.get("type") == "error"
-    ]
-    if errors:
-        logger.error(f"Turso pipeline reported {len(errors)} SQL statement error(s): {errors[:3]}")
-        raise RuntimeError(f"Turso SQL execution error: {errors[0]}")
-
+    except RuntimeError as exc:
+        logger.error(f"Turso pipeline failed: {exc}")
+        raise
     logger.info("Turso HTTP pipeline batch write committed successfully.")
 
 
@@ -595,17 +557,8 @@ def parse_turso_result_rows(res: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def query_turso_pipeline(pipeline_url: str, auth_token: str, requests_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    headers = {
-        "Authorization": f"Bearer {auth_token}",
-        "Content-Type": "application/json"
-    }
-    payload = {"requests": requests_list}
-    response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=20)
-    if response.status_code != 200:
-        sanitized = response.text.replace(auth_token, "***")
-        raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized}")
-    data = response.json()
-    return data.get("results", [])
+    """Read adapter over tfex_common.turso.execute_pipeline() (returns raw results)."""
+    return execute_pipeline(pipeline_url, auth_token, requests_list=requests_list, timeout=20)
 
 
 def ensure_telegram_log_table(pipeline_url: str, auth_token: str) -> None:
@@ -1089,8 +1042,6 @@ def build_checkpoint_message(
         )
 
     return f"{header}\n\n{body}{cdc_sec}"
-
-
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
