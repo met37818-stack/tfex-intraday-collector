@@ -28,6 +28,7 @@ from collector import (
     get_contract_last_trading_day,
     clean_mode_guard,
     _http_session,
+    is_tick_within_session,
 )
 
 
@@ -220,12 +221,15 @@ class TestCDCCollector(unittest.TestCase):
         self.assertEqual(len(mgr.bid_offer_cache), 0)
 
     @patch("collector.save_cdc_batch_to_turso")
-    def test_open_interest_is_none_in_baseline(self, mock_save):
+    def test_open_interest_passes_through_baseline(self, mock_save):
+        # The session loop refreshes the front future's OI from a REST quote, and
+        # every writer used to hardcode None, so the column was always NULL.
         mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
         mgr.latest_market_state["S50Z26"] = {
             "symbol": "S50Z26",
             "bid": 920.0, "ask": 920.5, "bid_vol": 10.0, "ask_vol": 20.0,
-            "last": 920.2, "volume": 100.0, "captured_at_bkk": "2026-11-19 09:45:00"
+            "last": 920.2, "volume": 100.0, "open_interest": 123456.0,
+            "captured_at_bkk": "2026-11-19 09:45:00"
         }
         mgr.latest_market_state["S50Z26C900"] = {
             "symbol": "S50Z26C900",
@@ -235,8 +239,8 @@ class TestCDCCollector(unittest.TestCase):
         mgr.capture_baseline_snapshot("https://dummy", "token", "09:45_MORNING_OPEN")
         self.assertTrue(mock_save.called)
         _, _, fut_rows, opt_rows = mock_save.call_args[0][:4]
-        self.assertIsNone(fut_rows[0]["open_interest"])
-        self.assertIsNone(opt_rows[0]["open_interest"])
+        self.assertEqual(fut_rows[0]["open_interest"], 123456.0, "known OI must be persisted")
+        self.assertIsNone(opt_rows[0]["open_interest"], "no OI in the stream stays NULL")
 
     def test_health_check_complete_and_partial(self):
         now_bkk = datetime.now(BANGKOK_TZ)
@@ -465,3 +469,25 @@ class TestHttpSessionPerThread(unittest.TestCase):
         thread.join()
 
         self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
+
+
+class TestSessionTickGuard(unittest.TestCase):
+    """Ticks outside the two continuous sessions must not be recorded."""
+
+    def test_pre_open_ticks_are_rejected(self):
+        from datetime import time as t
+
+        self.assertFalse(is_tick_within_session(t(8, 59)))
+        self.assertFalse(is_tick_within_session(t(9, 0)))
+        self.assertFalse(is_tick_within_session(t(9, 44, 59)))
+        self.assertTrue(is_tick_within_session(t(9, 45)))
+
+    def test_session_boundaries(self):
+        from datetime import time as t
+
+        self.assertTrue(is_tick_within_session(t(12, 30, 5)))
+        self.assertFalse(is_tick_within_session(t(12, 30, 6)))
+        self.assertFalse(is_tick_within_session(t(13, 44, 59)))
+        self.assertTrue(is_tick_within_session(t(13, 45)))
+        self.assertTrue(is_tick_within_session(t(16, 55, 5)))
+        self.assertFalse(is_tick_within_session(t(16, 55, 6)))

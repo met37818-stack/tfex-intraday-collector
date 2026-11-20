@@ -206,6 +206,16 @@ def detect_session_window(now_bkk: datetime) -> Optional[Dict[str, Any]]:
     return None
 
 
+def is_tick_within_session(now_t: time) -> bool:
+    """True only inside a continuous session: 09:45:00-12:30:05 or 13:45:00-16:55:05.
+
+    The previous guard only rejected the lunch break and everything after
+    16:55:05, so ticks arriving during the 09:00-09:44 pre-open window were
+    recorded as snapshots.
+    """
+    return (time(9, 45) <= now_t <= time(12, 30, 5)) or (time(13, 45) <= now_t <= time(16, 55, 5))
+
+
 def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
     """
     Checks if current Asia/Bangkok time is within official TFEX trading sessions:
@@ -1381,8 +1391,8 @@ class SettradeClientManager:
         now_bkk = datetime.now(BANGKOK_TZ)
         now_t = now_bkk.time()
 
-        # Cutoff guard: Do not record ticks outside trading hours (Morning: <= 12:30:05, Afternoon: <= 16:55:05)
-        if time(12, 30, 5) < now_t < time(13, 45) or now_t > time(16, 55, 5):
+        # Session guard: record ticks only inside the two continuous sessions
+        if not is_tick_within_session(now_t):
             return
 
         ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
@@ -1495,7 +1505,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": None
+                        "open_interest": it.get("open_interest")
                     })
                 else:
                     options_rows.append({
@@ -1510,7 +1520,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": None
+                        "open_interest": it.get("open_interest")
                     })
             else:
                 futures_rows.append({
@@ -1522,7 +1532,7 @@ class SettradeClientManager:
                     "ask_vol": it["ask_vol"],
                     "last": it["last"],
                     "volume": it["volume"],
-                    "open_interest": None
+                    "open_interest": it.get("open_interest")
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1573,7 +1583,7 @@ class SettradeClientManager:
                         "ask_vol": row.get("ask_vol", 0.0),
                         "last": row.get("last"),
                         "volume": row.get("volume", 0.0),
-                        "open_interest": None
+                        "open_interest": row.get("open_interest")
                     })
             else:
                 futures_rows.append({
@@ -1585,7 +1595,7 @@ class SettradeClientManager:
                     "ask_vol": row.get("ask_vol", 0.0),
                     "last": row.get("last"),
                     "volume": row.get("volume", 0.0),
-                    "open_interest": None
+                    "open_interest": row.get("open_interest")
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1666,9 +1676,10 @@ def fetch_option_quote_task(
                 "open_interest": fields["open_interest"]
             }
     except SettradeError:
+        # Unlisted strike / instrument not traded today: expected, not a failure.
         return None
     except Exception as e:
-        logger.debug(f"Option fetch error for {symbol}: {e}")
+        logger.warning(f"Option fetch error for {symbol}: {type(e).__name__}: {e}")
         return None
     return None
 
