@@ -27,6 +27,7 @@ from collector import (
     get_penultimate_business_day,
     get_contract_last_trading_day,
     clean_mode_guard,
+    _http_session,
 )
 
 
@@ -443,3 +444,24 @@ class TestCleanModeGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHttpSessionPerThread(unittest.TestCase):
+    """Option quotes are fetched from N worker threads; Session is not thread-safe."""
+
+    def test_session_is_per_thread(self):
+        import threading
+
+        main_session = _http_session()
+        self.assertIs(main_session, _http_session(), "same thread must reuse its session")
+
+        seen = {}
+
+        def grab():
+            seen["worker"] = _http_session()
+
+        thread = threading.Thread(target=grab)
+        thread.start()
+        thread.join()
+
+        self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")

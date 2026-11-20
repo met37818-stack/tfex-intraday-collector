@@ -139,21 +139,35 @@ def _market_data_ratelimit_init(self, *args, **kwargs):
     self.remaining_per_minute = 3600
 RateLimit.__init__ = _market_data_ratelimit_init
 
-# 2. Patch settrade_v2 with persistent requests.Session for HTTP Keep-Alive connection reuse
-_http_session = requests.Session()
+# 2. Patch settrade_v2 with a persistent requests.Session per thread for
+#    HTTP Keep-Alive connection reuse.
+#    Session is not thread-safe (its connection pool is shared mutable state),
+#    and option quotes are fetched through ThreadPoolExecutor(max_workers=N);
+#    a single shared session raced across those workers.
 _http_adapter = requests.adapters.HTTPAdapter(
     pool_connections=25,
     pool_maxsize=25,
     max_retries=1
 )
-_http_session.mount("https://", _http_adapter)
-_http_session.mount("http://", _http_adapter)
+_thread_local = threading.local()
 
-st_context.request = lambda method, url, **kwargs: _http_session.request(
-    method=method,
-    url=url,
-    **kwargs
-)
+
+def _http_session() -> requests.Session:
+    """One requests.Session per thread, sharing the tuned connection pool adapter."""
+    session = getattr(_thread_local, "http", None)
+    if session is None:
+        session = requests.Session()
+        session.mount("https://", _http_adapter)
+        session.mount("http://", _http_adapter)
+        _thread_local.http = session
+    return session
+
+
+def _patched_request(method: str, url: str, **kwargs):
+    return _http_session().request(method=method, url=url, **kwargs)
+
+
+st_context.request = _patched_request
 
 
 class PacedRateLimiter:
@@ -521,7 +535,7 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
     }
 
     try:
-        response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=30)
+        response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=30)
     except requests.exceptions.RequestException as e:
         logger.error(f"Turso network connection failed: {e}")
         raise
@@ -638,7 +652,7 @@ def query_turso_pipeline(pipeline_url: str, auth_token: str, requests_list: List
         "Content-Type": "application/json"
     }
     payload = {"requests": requests_list}
-    response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=20)
+    response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=20)
     if response.status_code != 200:
         sanitized = response.text.replace(auth_token, "***")
         raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized}")
@@ -1138,7 +1152,7 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
         "disable_web_page_preview": True
     }
     try:
-        resp = _http_session.post(url, json=payload, timeout=15)
+        resp = _http_session().post(url, json=payload, timeout=15)
         logger.info(f"[TELEGRAM] HTTP Status: {resp.status_code} | API Response: {resp.text}")
         if resp.status_code == 200 and resp.json().get("ok"):
             logger.info("Telegram alert sent successfully.")
