@@ -2330,12 +2330,47 @@ def load_dotenv_simple(env_path: str = ".env") -> None:
             logger.warning(f"Could not read .env file: {e}")
 
 
+def clean_mode_guard(clean: bool, confirm_clean: bool) -> Optional[str]:
+    """Reason `--clean` must be refused, or None when it is explicitly confirmed.
+
+    --clean runs `DELETE FROM ...` with no WHERE clause against three tables;
+    it used to be reachable from the workflow dispatch dropdown (one click away
+    from `session`) with no confirmation step at all.
+    """
+    if not clean:
+        return None
+    if confirm_clean:
+        return None
+    return (
+        "--clean deletes EVERY row in options_snapshots, futures_snapshots and spot_snapshots "
+        "with no backup and no date filter. Re-run with --confirm-clean if that is intended."
+    )
+
+
 def run_clean_db(pipeline_url: str, auth_token: str) -> None:
     """
     Cleans incomplete/stale intraday snapshot data and logs from Turso Cloud SQLite.
     Preserves thor_rates and other non-intraday reference tables.
     """
     logger.info("[CLEAN] Purging stale/incomplete intraday data from Turso Cloud SQLite...")
+    pre_counts = query_turso_pipeline(pipeline_url, auth_token, [
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM options_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM futures_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM spot_snapshots;"}},
+        {"type": "close"},
+    ])
+    try:
+        pre = [
+            int(parse_turso_result_rows(pre_counts[i]["response"]["result"])[0]["cnt"] or 0)
+            for i in range(3)
+        ]
+        logger.warning(
+            f"[CLEAN] About to delete ALL rows: options_snapshots={pre[0]:,}, "
+            f"futures_snapshots={pre[1]:,}, spot_snapshots={pre[2]:,}"
+        )
+    except Exception as pre_err:
+        logger.warning(f"[CLEAN] Could not pre-count rows before delete: {pre_err}")
+
     clean_stmts = [
         {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots;"}},
         {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots;"}},
@@ -2383,6 +2418,11 @@ def main() -> None:
         help="Manually trigger and send the latest intraday status report to Telegram."
     )
     parser.add_argument(
+        "--confirm-clean",
+        action="store_true",
+        help="Required together with --clean: acknowledges that --clean deletes every intraday row."
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Bypass trading hours and holiday guards."
@@ -2400,6 +2440,11 @@ def main() -> None:
         help="Maximum requests per second to avoid 429 gateway burst (default: 45.0)."
     )
     args = parser.parse_args()
+
+    refusal = clean_mode_guard(args.clean, args.confirm_clean)
+    if refusal:
+        logger.error(f"[CLEAN GUARD] {refusal}")
+        sys.exit(2)
 
     load_dotenv_simple(".env")
 

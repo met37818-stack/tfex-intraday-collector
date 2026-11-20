@@ -25,7 +25,8 @@ from collector import (
     SESSION_CONFIG,
     BANGKOK_TZ,
     get_penultimate_business_day,
-    get_contract_last_trading_day
+    get_contract_last_trading_day,
+    clean_mode_guard,
 )
 
 
@@ -425,6 +426,19 @@ class TestCDCCollector(unittest.TestCase):
 
         ltd = get_contract_last_trading_day(2026, 12)
         self.assertEqual(ltd.strftime("%Y-%m-%d %H:%M:%S"), "2026-12-29 16:30:00")
+
+
+class TestCleanModeGuard(unittest.TestCase):
+    """--clean wipes three tables with no WHERE clause; it needs a second key."""
+
+    def test_clean_requires_explicit_confirmation(self):
+        self.assertIsNone(clean_mode_guard(False, False), "non-clean runs are never blocked")
+        self.assertIsNone(clean_mode_guard(False, True))
+        refusal = clean_mode_guard(True, False)
+        self.assertIsNotNone(refusal)
+        self.assertIn("--confirm-clean", refusal)
+        self.assertIn("EVERY row", refusal)
+        self.assertIsNone(clean_mode_guard(True, True))
 
 
 if __name__ == "__main__":
