@@ -6,7 +6,7 @@ and writes batch snapshots into Turso Cloud SQLite via HTTP Pipeline API (/v2/pi
 
 Supports:
 - Persistent Session Worker Loop (--session): Runs continuous 1-minute collection
-  during morning (09:45-12:30) and afternoon (14:15-16:55) sessions.
+  during morning (09:45-12:30) and afternoon (13:45-16:55) sessions.
 - Single Snapshot (--once): Captures 1 minute snapshot and exits.
 - Telegram Checkpoint Inspection (--notify): Sends manual status report to Telegram.
 """
@@ -117,9 +117,9 @@ SESSION_CONFIG = {
     "AFTERNOON": {
         "name": "AFTERNOON",
         "wakeup_start": time(13, 0),
-        "pre_warm_time": time(14, 14, 30),
-        "market_open": time(14, 15),
-        "verify_holiday": time(14, 25),
+        "pre_warm_time": time(13, 44, 30),
+        "market_open": time(13, 45),
+        "verify_holiday": time(13, 55),
         "market_close": time(16, 55),
         "cutoff_time": time(16, 55, 5),
         "session_end": time(16, 55, 10),
@@ -182,7 +182,7 @@ def detect_session_window(now_bkk: datetime) -> Optional[Dict[str, Any]]:
     """
     Identifies if current Asia/Bangkok time falls into MORNING or AFTERNOON worker window.
     - MORNING: 09:00 - 12:30:10 (Wakeup ~09:15, Pre-warm <=09:44:30, Open 09:45, Cutoff 12:30:05)
-    - AFTERNOON: 13:00 - 16:55:10 (Wakeup ~13:45, Pre-warm <=14:14:30, Open 14:15, Cutoff 16:55:05)
+    - AFTERNOON: 13:00 - 16:55:10 (Wakeup ~13:15, Pre-warm <=13:44:30, Open 13:45, Cutoff 16:55:05)
     """
     curr_t = now_bkk.time()
     if time(9, 0) <= curr_t <= time(12, 30, 10):
@@ -197,7 +197,7 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
     Checks if current Asia/Bangkok time is within official TFEX trading sessions:
     - Monday to Friday only
     - Morning Session:   09:45 - 12:30:05
-    - Afternoon Session: 14:15 - 16:55:05
+    - Afternoon Session: 13:45 - 16:55:05
     """
     weekday = dt.weekday()
     if weekday > 4:
@@ -207,13 +207,13 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
     current_time = dt.time()
     morning_open = time(9, 45)
     morning_close = time(12, 30, 5)
-    afternoon_open = time(14, 15)
+    afternoon_open = time(13, 45)
     afternoon_close = time(16, 55, 5)
 
     if morning_open <= current_time <= morning_close:
         return True, "Morning Session (09:45 - 12:30)"
     if afternoon_open <= current_time <= afternoon_close:
-        return True, "Afternoon Session (14:15 - 16:55)"
+        return True, "Afternoon Session (13:45 - 16:55)"
 
     return False, f"Outside sessions (Current time: {dt.strftime('%H:%M:%S')})"
 
@@ -846,7 +846,7 @@ LIMIT 1;""",
         # 5. morning bars
         f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:30:05';",
         # 6. afternoon bars
-        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 16:55:05';",
+        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 13:45:00' AND captured_at_bkk <= '{trade_date} 16:55:05';",
         # 7. pragma page_count
         "PRAGMA page_count;",
         # 8. pragma page_size
@@ -949,15 +949,15 @@ def get_current_checkpoint(t: time) -> Optional[str]:
     """
     4-Checkpoint alert schedules:
     1. MORNING_OPEN: 10:00 (10:00 - 12:29:59) - Active across morning session once market opens
-    2. MIDDAY_CLOSE: 12:30 (12:30 - 13:30) - Midday break report
-    3. AFTERNOON_OPEN: 14:30 (14:30 - 16:54:59) - Active across afternoon session once market opens
+    2. MIDDAY_CLOSE: 12:30 (12:30 - 13:44:59) - Midday break report
+    3. AFTERNOON_OPEN: 14:00 (14:00 - 16:54:59) - Active across afternoon session once market opens (15 min after 13:45 open)
     4. EVENING_CLOSE: 16:55 (16:55 - 18:30) - Full-day close summary
     """
     if time(10, 0) <= t < time(12, 30):
         return "MORNING_OPEN"
-    if time(12, 30) <= t <= time(13, 30):
+    if time(12, 30) <= t < time(13, 45):
         return "MIDDAY_CLOSE"
-    if time(14, 30) <= t < time(16, 55):
+    if time(14, 0) <= t < time(16, 55):
         return "AFTERNOON_OPEN"
     if time(16, 55) <= t <= time(18, 30):
         return "EVENING_CLOSE"
@@ -1047,9 +1047,9 @@ def build_checkpoint_message(
         warn = "\n⚠️ <b>Alert:</b> No bars captured yet for afternoon session!" if afternoon_bars == 0 else ""
         body = (
             f"📈 <b>TFEX INTRADAY: AFTERNOON OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 16:55)\n"
+            f"• <b>Status:</b> 🟢 Afternoon Session Active (13:45 - 16:55)\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
-            f"• <b>Afternoon Bars (since 14:15):</b> <b>{afternoon_bars}</b> bars\n"
+            f"• <b>Afternoon Bars (since 13:45):</b> <b>{afternoon_bars}</b> bars\n"
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
             f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
             f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts\n"
@@ -1057,14 +1057,14 @@ def build_checkpoint_message(
             f"• <b>Storage:</b> Turso SQLite {db_size}{warn}"
         )
     else:  # EVENING_CLOSE or MANUAL_REPORT
-        total_expected = 325.0
+        total_expected = 355.0
         c_pct = (spot_count / total_expected) * 100.0 if spot_count else 0.0
         if c_pct >= 99.0:
             verdict = "🟢 Complete (≥99%)"
         elif c_pct >= 90.0:
-            verdict = f"🟡 Partial ({spot_count}/325 bars)"
+            verdict = f"🟡 Partial ({spot_count}/355 bars)"
         else:
-            verdict = f"🚨 Incomplete ({spot_count}/325 bars)"
+            verdict = f"🚨 Incomplete ({spot_count}/355 bars)"
 
         title = "🏁 <b>TFEX INTRADAY: FULL-DAY CLOSE SUMMARY</b>" if checkpoint == "EVENING_CLOSE" else "📊 <b>TFEX INTRADAY: CURRENT STATUS REPORT</b>"
         body = (
@@ -1072,9 +1072,9 @@ def build_checkpoint_message(
             f"• <b>Status:</b> 🔒 Market Closed\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Trading Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
-            f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 325 ({c_pct:.1f}%)\n"
+            f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 355 ({c_pct:.1f}%)\n"
             f"  - Morning (09:45-12:30): {morning_bars} bars\n"
-            f"  - Afternoon (14:15-16:55): {afternoon_bars} bars\n"
+            f"  - Afternoon (13:45-16:55): {afternoon_bars} bars\n"
             f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
             f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
             f"• <b>API/DB Errors:</b> {err_str}\n"
@@ -1361,7 +1361,7 @@ class SettradeClientManager:
         now_t = now_bkk.time()
 
         # Cutoff guard: Do not record ticks outside trading hours (Morning: <= 12:30:05, Afternoon: <= 16:55:05)
-        if time(12, 30, 5) < now_t < time(14, 15) or now_t > time(16, 55, 5):
+        if time(12, 30, 5) < now_t < time(13, 45) or now_t > time(16, 55, 5):
             return
 
         ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
@@ -1838,7 +1838,7 @@ def wait_for_market_open(target_open_time: time, session_name: str) -> None:
 
 def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: datetime) -> None:
     """
-    10 minutes past market open (09:55 or 14:25), checks whether today's trading
+    10 minutes past market open (09:55 or 13:55), checks whether today's trading
     activity has started on Front Futures or SET50. If no today candles exist, exits gracefully (sys.exit(0)).
     """
     front_fut_symbol = f"S50{front_opt_series}"
@@ -1975,7 +1975,7 @@ def run_session_worker(
         sys.exit(1)
 
     # 4. Pre-warm: Ensure schema, resolve contracts, and subscribe ALL symbols to Realtime Pool
-    # Pre-warming runs immediately (before 09:44:30 / 14:14:30) to guarantee the WebSocket pool is 100% connected
+    # Pre-warming runs immediately (before 09:44:30 / 13:44:30) to guarantee the WebSocket pool is 100% connected
     now_bkk = datetime.now(BANGKOK_TZ)
     ensure_database_schema(turso_pipeline_url, turso_token)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
@@ -2025,7 +2025,7 @@ def run_session_worker(
             if stop_event.is_set():
                 break
             now_t = datetime.now(BANGKOK_TZ).time()
-            in_market = (time(9, 45) <= now_t <= time(12, 30)) or (time(14, 15) <= now_t <= time(16, 55))
+            in_market = (time(9, 45) <= now_t <= time(12, 30)) or (time(13, 45) <= now_t <= time(16, 55))
             if in_market:
                 is_healthy, elapsed = settrade_mgr.check_watchdog_health()
                 if not is_healthy:
@@ -2140,7 +2140,7 @@ def run_session_worker(
             except Exception as fut_err:
                 logger.debug(f"[FUTURES QUOTE] Could not refresh {front_fut_symbol} quote: {fut_err}")
 
-        # Baseline Snapshot Trigger (09:45, 12:30, 14:15, 16:55 + 30-min heartbeats)
+        # Baseline Snapshot Trigger (09:45, 12:30, 13:45, 16:55 + 30-min heartbeats)
         h, m = loop_time.hour, loop_time.minute
         ts_minute_key = f"{loop_now.strftime('%Y%m%d')}_{h:02d}{m:02d}"
         if ts_minute_key not in triggered_baselines:
@@ -2149,12 +2149,12 @@ def run_session_worker(
                 checkpoint_name = "09:45_MORNING_OPEN"
             elif h == 12 and m == 30:
                 checkpoint_name = "12:30_MIDDAY_CLOSE"
-            elif h == 14 and m == 15:
-                checkpoint_name = "14:15_AFTERNOON_OPEN"
+            elif h == 13 and m == 45:
+                checkpoint_name = "13:45_AFTERNOON_OPEN"
             elif h == 16 and m == 55:
                 checkpoint_name = "16:55_EVENING_CLOSE"
             elif m in (15, 45):
-                in_market = (time(9, 45) <= loop_time <= time(12, 30)) or (time(14, 15) <= loop_time <= time(16, 55))
+                in_market = (time(9, 45) <= loop_time <= time(12, 30)) or (time(13, 45) <= loop_time <= time(16, 55))
                 if in_market:
                     checkpoint_name = f"{h:02d}:{m:02d}_HEARTBEAT_30M"
 
@@ -2174,7 +2174,7 @@ def run_session_worker(
             check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, loop_now)
             market_verified = True
 
-        # Telegram 4-checkpoint alerts evaluation (10:00, 12:30, 14:30, 16:55)
+        # Telegram 4-checkpoint alerts evaluation (10:00, 12:30, 14:00, 16:55)
         if telegram_bot_token and telegram_chat_id:
             try:
                 check_and_send_checkpoints(
@@ -2358,7 +2358,7 @@ def main() -> None:
     parser.add_argument(
         "--session",
         action="store_true",
-        help="Run persistent 1-minute session worker loop until session closes (Morning: 09:45-12:30, Afternoon: 14:15-16:55)."
+        help="Run persistent 1-minute session worker loop until session closes (Morning: 09:45-12:30, Afternoon: 13:45-16:55)."
     )
     parser.add_argument(
         "--once",

@@ -320,11 +320,11 @@ class TestCDCCollector(unittest.TestCase):
 
         # 1. Pre-warm timings
         self.assertEqual(SESSION_CONFIG["MORNING"]["pre_warm_time"], time(9, 44, 30))
-        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["pre_warm_time"], time(14, 14, 30))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["pre_warm_time"], time(13, 44, 30))
 
         # 2. Market open timings
         self.assertEqual(SESSION_CONFIG["MORNING"]["market_open"], time(9, 45))
-        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["market_open"], time(14, 15))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["market_open"], time(13, 45))
 
         # 3. Market close and cutoff timings
         self.assertEqual(SESSION_CONFIG["MORNING"]["market_close"], time(12, 30))
@@ -337,7 +337,8 @@ class TestCDCCollector(unittest.TestCase):
         self.assertEqual(get_current_checkpoint(time(12, 29, 59)), "MORNING_OPEN")
         self.assertEqual(get_current_checkpoint(time(12, 30, 0)), "MIDDAY_CLOSE")
         self.assertEqual(get_current_checkpoint(time(13, 0)), "MIDDAY_CLOSE")
-        self.assertEqual(get_current_checkpoint(time(14, 30)), "AFTERNOON_OPEN")
+        self.assertEqual(get_current_checkpoint(time(13, 44, 59)), "MIDDAY_CLOSE")
+        self.assertEqual(get_current_checkpoint(time(14, 0)), "AFTERNOON_OPEN")
         self.assertEqual(get_current_checkpoint(time(16, 54, 59)), "AFTERNOON_OPEN")
         self.assertEqual(get_current_checkpoint(time(16, 55, 0)), "EVENING_CLOSE")
         self.assertEqual(get_current_checkpoint(time(17, 30)), "EVENING_CLOSE")
@@ -353,6 +354,62 @@ class TestCDCCollector(unittest.TestCase):
         self.assertTrue(in_h)
         in_h, _ = is_within_trading_hours(fri_12_30_06)
         self.assertFalse(in_h)
+
+        # Afternoon trading hours boundaries (13:45:00 - 16:55:05)
+        fri_13_44_59 = datetime(2026, 11, 20, 13, 44, 59, tzinfo=BANGKOK_TZ)
+        fri_13_45_00 = datetime(2026, 11, 20, 13, 45, 0, tzinfo=BANGKOK_TZ)
+        fri_16_55_05 = datetime(2026, 11, 20, 16, 55, 5, tzinfo=BANGKOK_TZ)
+        fri_16_55_06 = datetime(2026, 11, 20, 16, 55, 6, tzinfo=BANGKOK_TZ)
+
+        in_h, _ = is_within_trading_hours(fri_13_44_59)
+        self.assertFalse(in_h)
+        in_h, _ = is_within_trading_hours(fri_13_45_00)
+        self.assertTrue(in_h)
+        in_h, _ = is_within_trading_hours(fri_16_55_05)
+        self.assertTrue(in_h)
+        in_h, _ = is_within_trading_hours(fri_16_55_06)
+        self.assertFalse(in_h)
+
+    def test_full_day_355_bars_health_verdict(self):
+        now_bkk = datetime.now(BANGKOK_TZ)
+        base_stats = {
+            "spot_last": 925.3,
+            "spot_vol": 1000000.0,
+            "fut_count": 355,
+            "fut_symbol": "S50Z26",
+            "fut_last": 926.0,
+            "fut_oi": 500000.0,
+            "opt_count": 5000,
+            "opt_syms": 120,
+            "morning_bars": 165,
+            "afternoon_bars": 190,
+            "min_ts": "09:45:00",
+            "max_ts": "16:55:00",
+            "db_size_str": "15.0 MB",
+            "db_pages": 3800,
+            "error_count": 0
+        }
+
+        # 1. 355/355 bars (100%) -> 🟢 Complete (>= 99%)
+        stats_355 = dict(base_stats, spot_count=355)
+        msg_355 = build_checkpoint_message("EVENING_CLOSE", "2026-11-20", now_bkk, stats_355)
+        self.assertIn("Integrity Verdict:</b> 🟢 Complete (≥99%)", msg_355)
+        self.assertIn("<b>355</b> / 355 (100.0%)", msg_355)
+
+        # 2. 352/355 bars (99.2%) -> 🟢 Complete (>= 99%)
+        stats_352 = dict(base_stats, spot_count=352)
+        msg_352 = build_checkpoint_message("EVENING_CLOSE", "2026-11-20", now_bkk, stats_352)
+        self.assertIn("Integrity Verdict:</b> 🟢 Complete (≥99%)", msg_352)
+
+        # 3. 320/355 bars (90.1%) -> 🟡 Partial (320/355 bars)
+        stats_320 = dict(base_stats, spot_count=320)
+        msg_320 = build_checkpoint_message("EVENING_CLOSE", "2026-11-20", now_bkk, stats_320)
+        self.assertIn("Integrity Verdict:</b> 🟡 Partial (320/355 bars)", msg_320)
+
+        # 4. 300/355 bars (84.5%) -> 🚨 Incomplete (300/355 bars)
+        stats_300 = dict(base_stats, spot_count=300)
+        msg_300 = build_checkpoint_message("EVENING_CLOSE", "2026-11-20", now_bkk, stats_300)
+        self.assertIn("Integrity Verdict:</b> 🚨 Incomplete (300/355 bars)", msg_300)
 
 
 if __name__ == "__main__":
