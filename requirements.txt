@@ -1,5 +1,8 @@
-settrade_v2
-requests
-pytz
-paho-mqtt<2,>=1.6
-
+# Pinned for reproducibility (resolved on CPython 3.11, the workflow interpreter).
+requests==2.34.2
+pytz==2026.6
+settrade_v2==2.2.1
+paho-mqtt==1.6.1
+# Shared calendar / Telegram helpers (extracted 2026-11). Pinned to a tag so a
+# shared fix cannot reach production without review.
+tfex-common @ git+https://github.com/met37818-stack/tfex-common.git@v0.2.0
