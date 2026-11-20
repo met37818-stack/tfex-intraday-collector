@@ -73,48 +73,53 @@ class TestCDCCollector(unittest.TestCase):
     def test_coalescing_buffer_deduplication(self):
         mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
         
-        # Simulate 10 incoming ticks for symbol S50Z26 within 1 micro-batch window
-        for i in range(10):
-            mock_msg = {
+        with patch("collector.datetime") as mock_dt:
+            mock_now = datetime(2026, 11, 20, 10, 15, 0, tzinfo=BANGKOK_TZ)
+            mock_dt.now.return_value = mock_now
+            mock_dt.strftime = datetime.strftime
+
+            # Simulate 10 incoming ticks for symbol S50Z26 within 1 micro-batch window
+            for i in range(10):
+                mock_msg = {
+                    "is_success": True,
+                    "data": {
+                        "symbol": "S50Z26",
+                        "bid_price1": 920.0 + i * 0.1,
+                        "ask_price1": 920.5 + i * 0.1,
+                        "bid_volume1": 100 + i,
+                        "ask_volume1": 200 + i,
+                        "last": 920.2 + i * 0.1,
+                        "total_volume": 1000 + i
+                    }
+                }
+                mgr.on_bid_offer(mock_msg)
+
+            # Buffer should contain exactly 1 entry for S50Z26 (the coalesced latest state)
+            self.assertEqual(len(mgr.coalesced_buffer), 1)
+            latest = mgr.coalesced_buffer["S50Z26"]
+            self.assertAlmostEqual(latest["bid"], 920.9)
+            self.assertEqual(latest["bid_vol"], 109)
+            self.assertEqual(mgr.cdc_stats["received"], 10)
+            self.assertEqual(mgr.cdc_stats["changed"], 10)
+            self.assertEqual(mgr.cdc_stats["deduped"], 0)
+
+            # Send an identical 11th tick -> should be filtered out by noise filter
+            identical_msg = {
                 "is_success": True,
                 "data": {
                     "symbol": "S50Z26",
-                    "bid_price1": 920.0 + i * 0.1,
-                    "ask_price1": 920.5 + i * 0.1,
-                    "bid_volume1": 100 + i,
-                    "ask_volume1": 200 + i,
-                    "last": 920.2 + i * 0.1,
-                    "total_volume": 1000 + i
+                    "bid_price1": 920.9,
+                    "ask_price1": 921.4,
+                    "bid_volume1": 109,
+                    "ask_volume1": 209,
+                    "last": 921.1,
+                    "total_volume": 1009
                 }
             }
-            mgr.on_bid_offer(mock_msg)
-
-        # Buffer should contain exactly 1 entry for S50Z26 (the coalesced latest state)
-        self.assertEqual(len(mgr.coalesced_buffer), 1)
-        latest = mgr.coalesced_buffer["S50Z26"]
-        self.assertAlmostEqual(latest["bid"], 920.9)
-        self.assertEqual(latest["bid_vol"], 109)
-        self.assertEqual(mgr.cdc_stats["received"], 10)
-        self.assertEqual(mgr.cdc_stats["changed"], 10)
-        self.assertEqual(mgr.cdc_stats["deduped"], 0)
-
-        # Send an identical 11th tick -> should be filtered out by noise filter
-        identical_msg = {
-            "is_success": True,
-            "data": {
-                "symbol": "S50Z26",
-                "bid_price1": 920.9,
-                "ask_price1": 921.4,
-                "bid_volume1": 109,
-                "ask_volume1": 209,
-                "last": 921.1,
-                "total_volume": 1009
-            }
-        }
-        mgr.on_bid_offer(identical_msg)
-        self.assertEqual(mgr.cdc_stats["received"], 11)
-        self.assertEqual(mgr.cdc_stats["changed"], 10)
-        self.assertEqual(mgr.cdc_stats["deduped"], 1)
+            mgr.on_bid_offer(identical_msg)
+            self.assertEqual(mgr.cdc_stats["received"], 11)
+            self.assertEqual(mgr.cdc_stats["changed"], 10)
+            self.assertEqual(mgr.cdc_stats["deduped"], 1)
 
     def test_watchdog_silence_detection(self):
         mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
