@@ -19,6 +19,10 @@ from collector import (
     build_turso_pipeline_payload,
     SettradeClientManager,
     build_checkpoint_message,
+    get_current_checkpoint,
+    detect_session_window,
+    is_within_trading_hours,
+    SESSION_CONFIG,
     BANGKOK_TZ
 )
 
@@ -224,6 +228,131 @@ class TestCDCCollector(unittest.TestCase):
         _, _, fut_rows, opt_rows = mock_save.call_args[0][:4]
         self.assertIsNone(fut_rows[0]["open_interest"])
         self.assertIsNone(opt_rows[0]["open_interest"])
+
+    def test_health_check_complete_and_partial(self):
+        now_bkk = datetime.now(BANGKOK_TZ)
+        base_stats = {
+            "spot_count": 165,
+            "spot_last": 925.3,
+            "spot_vol": 1000000.0,
+            "fut_count": 165,
+            "fut_symbol": "S50Z26",
+            "fut_last": 926.0,
+            "fut_oi": 500000.0,
+            "opt_count": 3000,
+            "opt_syms": 120,
+            "min_ts": "09:45:00",
+            "max_ts": "12:30:00",
+            "db_size_str": "12.4 MB (0.24% ของโควต้า 5 GB)",
+            "db_pages": 3100,
+            "error_count": 0
+        }
+
+        # 1. 100% (165/165 bars) -> 🟢 Complete
+        stats_100 = dict(base_stats, morning_bars=165)
+        msg_100 = build_checkpoint_message("MIDDAY_CLOSE", "2026-11-20", now_bkk, stats_100)
+        self.assertIn("Health Check:</b> 🟢 Complete", msg_100)
+
+        # 2. 99.4% (164/165 bars) -> 🟢 Complete (>= 99%)
+        stats_99 = dict(base_stats, morning_bars=164)
+        msg_99 = build_checkpoint_message("MIDDAY_CLOSE", "2026-11-20", now_bkk, stats_99)
+        self.assertIn("Health Check:</b> 🟢 Complete", msg_99)
+
+        # 3. 98.8% (163/165 bars) -> 🟡 Partial (163/165 bars) (< 99%)
+        stats_98 = dict(base_stats, morning_bars=163)
+        msg_98 = build_checkpoint_message("MIDDAY_CLOSE", "2026-11-20", now_bkk, stats_98)
+        self.assertIn("Health Check:</b> 🟡 Partial (163/165 bars)", msg_98)
+
+        # 4. 90.9% (150/165 bars) -> 🟡 Partial (150/165 bars)
+        stats_90 = dict(base_stats, morning_bars=150)
+        msg_90 = build_checkpoint_message("MIDDAY_CLOSE", "2026-11-20", now_bkk, stats_90)
+        self.assertIn("Health Check:</b> 🟡 Partial (150/165 bars)", msg_90)
+
+    def test_on_bid_offer_preserves_last_and_volume(self):
+        mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
+
+        # First tick has trade execution price (last=920.5, volume=50)
+        t1 = {
+            "is_success": True,
+            "data": {
+                "symbol": "S50Z26",
+                "bid_price1": 920.4,
+                "ask_price1": 920.6,
+                "bid_volume1": 10,
+                "ask_volume1": 20,
+                "last": 920.5,
+                "total_volume": 50
+            }
+        }
+        with patch("collector.datetime") as mock_dt:
+            # Within market hours: 10:15:00
+            mock_now = datetime(2026, 11, 20, 10, 15, 0, tzinfo=BANGKOK_TZ)
+            mock_dt.now.return_value = mock_now
+            mock_dt.strftime = datetime.strftime
+            mgr.on_bid_offer(t1)
+
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["last"], 920.5)
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["volume"], 50)
+
+            # Second tick is a pure bid/offer order book change without last price (last=None, volume=0)
+            t2 = {
+                "is_success": True,
+                "data": {
+                    "symbol": "S50Z26",
+                    "bid_price1": 920.3,
+                    "ask_price1": 920.5,
+                    "bid_volume1": 15,
+                    "ask_volume1": 25,
+                    "last": None,
+                    "total_volume": None
+                }
+            }
+            mgr.on_bid_offer(t2)
+
+            # Verify that last and volume are PRESERVED and not overwritten by None / 0
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["last"], 920.5)
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["volume"], 50)
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["bid"], 920.3)
+            self.assertEqual(mgr.latest_market_state["S50Z26"]["ask"], 920.5)
+
+    def test_session_config_and_cutoff_timings(self):
+        from datetime import time
+
+        # 1. Pre-warm timings
+        self.assertEqual(SESSION_CONFIG["MORNING"]["pre_warm_time"], time(9, 44, 30))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["pre_warm_time"], time(14, 14, 30))
+
+        # 2. Market open timings
+        self.assertEqual(SESSION_CONFIG["MORNING"]["market_open"], time(9, 45))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["market_open"], time(14, 15))
+
+        # 3. Market close and cutoff timings
+        self.assertEqual(SESSION_CONFIG["MORNING"]["market_close"], time(12, 30))
+        self.assertEqual(SESSION_CONFIG["MORNING"]["cutoff_time"], time(12, 30, 5))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["market_close"], time(16, 55))
+        self.assertEqual(SESSION_CONFIG["AFTERNOON"]["cutoff_time"], time(16, 55, 5))
+
+        # 4. Checkpoint mapping
+        self.assertEqual(get_current_checkpoint(time(10, 0)), "MORNING_OPEN")
+        self.assertEqual(get_current_checkpoint(time(12, 29, 59)), "MORNING_OPEN")
+        self.assertEqual(get_current_checkpoint(time(12, 30, 0)), "MIDDAY_CLOSE")
+        self.assertEqual(get_current_checkpoint(time(13, 0)), "MIDDAY_CLOSE")
+        self.assertEqual(get_current_checkpoint(time(14, 30)), "AFTERNOON_OPEN")
+        self.assertEqual(get_current_checkpoint(time(16, 54, 59)), "AFTERNOON_OPEN")
+        self.assertEqual(get_current_checkpoint(time(16, 55, 0)), "EVENING_CLOSE")
+        self.assertEqual(get_current_checkpoint(time(17, 30)), "EVENING_CLOSE")
+
+        # 5. Trading hours check at cutoff boundaries
+        fri_12_30_00 = datetime(2026, 11, 20, 12, 30, 0, tzinfo=BANGKOK_TZ)
+        fri_12_30_05 = datetime(2026, 11, 20, 12, 30, 5, tzinfo=BANGKOK_TZ)
+        fri_12_30_06 = datetime(2026, 11, 20, 12, 30, 6, tzinfo=BANGKOK_TZ)
+
+        in_h, _ = is_within_trading_hours(fri_12_30_00)
+        self.assertTrue(in_h)
+        in_h, _ = is_within_trading_hours(fri_12_30_05)
+        self.assertTrue(in_h)
+        in_h, _ = is_within_trading_hours(fri_12_30_06)
+        self.assertFalse(in_h)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ and writes batch snapshots into Turso Cloud SQLite via HTTP Pipeline API (/v2/pi
 
 Supports:
 - Persistent Session Worker Loop (--session): Runs continuous 1-minute collection
-  during morning (09:45-12:35) and afternoon (14:15-17:05) sessions.
+  during morning (09:45-12:30) and afternoon (14:15-16:55) sessions.
 - Single Snapshot (--once): Captures 1 minute snapshot and exits.
 - Telegram Checkpoint Inspection (--notify): Sends manual status report to Telegram.
 """
@@ -107,16 +107,22 @@ SESSION_CONFIG = {
     "MORNING": {
         "name": "MORNING",
         "wakeup_start": time(9, 0),
+        "pre_warm_time": time(9, 44, 30),
         "market_open": time(9, 45),
         "verify_holiday": time(9, 55),
-        "session_end": time(12, 35),
+        "market_close": time(12, 30),
+        "cutoff_time": time(12, 30, 5),
+        "session_end": time(12, 30, 10),
     },
     "AFTERNOON": {
         "name": "AFTERNOON",
         "wakeup_start": time(13, 0),
+        "pre_warm_time": time(14, 14, 30),
         "market_open": time(14, 15),
         "verify_holiday": time(14, 25),
-        "session_end": time(17, 5),
+        "market_close": time(16, 55),
+        "cutoff_time": time(16, 55, 5),
+        "session_end": time(16, 55, 10),
     }
 }
 
@@ -175,13 +181,13 @@ class PacedRateLimiter:
 def detect_session_window(now_bkk: datetime) -> Optional[Dict[str, Any]]:
     """
     Identifies if current Asia/Bangkok time falls into MORNING or AFTERNOON worker window.
-    - MORNING: 09:00 - 12:35 (Wakeup ~09:15, Open 09:45, Close 12:35)
-    - AFTERNOON: 13:00 - 17:05 (Wakeup ~13:45, Open 14:15, Close 17:05)
+    - MORNING: 09:00 - 12:30:10 (Wakeup ~09:15, Pre-warm <=09:44:30, Open 09:45, Cutoff 12:30:05)
+    - AFTERNOON: 13:00 - 16:55:10 (Wakeup ~13:45, Pre-warm <=14:14:30, Open 14:15, Cutoff 16:55:05)
     """
     curr_t = now_bkk.time()
-    if time(9, 0) <= curr_t <= time(12, 35):
+    if time(9, 0) <= curr_t <= time(12, 30, 10):
         return SESSION_CONFIG["MORNING"]
-    if time(13, 0) <= curr_t <= time(17, 5):
+    if time(13, 0) <= curr_t <= time(16, 55, 10):
         return SESSION_CONFIG["AFTERNOON"]
     return None
 
@@ -190,8 +196,8 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
     """
     Checks if current Asia/Bangkok time is within official TFEX trading sessions:
     - Monday to Friday only
-    - Morning Session:   09:45 - 12:35
-    - Afternoon Session: 14:15 - 17:05
+    - Morning Session:   09:45 - 12:30:05
+    - Afternoon Session: 14:15 - 16:55:05
     """
     weekday = dt.weekday()
     if weekday > 4:
@@ -200,14 +206,14 @@ def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
 
     current_time = dt.time()
     morning_open = time(9, 45)
-    morning_close = time(12, 35)
+    morning_close = time(12, 30, 5)
     afternoon_open = time(14, 15)
-    afternoon_close = time(17, 5)
+    afternoon_close = time(16, 55, 5)
 
     if morning_open <= current_time <= morning_close:
-        return True, "Morning Session (09:45 - 12:35)"
+        return True, "Morning Session (09:45 - 12:30)"
     if afternoon_open <= current_time <= afternoon_close:
-        return True, "Afternoon Session (14:15 - 17:05)"
+        return True, "Afternoon Session (14:15 - 16:55)"
 
     return False, f"Outside sessions (Current time: {dt.strftime('%H:%M:%S')})"
 
@@ -826,21 +832,21 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
         f"SELECT last, volume, value, captured_at_bkk FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC LIMIT 1;",
         # 2. futures stats
         f"SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
-        # 3. latest front futures (Prioritize Front Quarter series e.g. S50Z26, then highest OI & volume)
+        # 3. latest front futures (Prioritize Front Quarter series e.g. S50Z26, and valid last price)
         f"""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk 
 FROM futures_snapshots 
 WHERE captured_at_bkk LIKE '{trade_date}%' 
-ORDER BY captured_at_bkk DESC, 
-         CASE WHEN symbol = '{front_fut_symbol}' THEN 1 ELSE 0 END DESC, 
-         open_interest DESC, 
-         volume DESC 
+ORDER BY (CASE WHEN symbol = '{front_fut_symbol}' AND last IS NOT NULL AND last > 0 THEN 3
+               WHEN symbol = '{front_fut_symbol}' THEN 2
+               WHEN last IS NOT NULL AND last > 0 THEN 1 ELSE 0 END) DESC,
+         captured_at_bkk DESC 
 LIMIT 1;""",
         # 4. options stats
         f"SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
         # 5. morning bars
-        f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:35:00';",
+        f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:30:05';",
         # 6. afternoon bars
-        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 17:05:00';",
+        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 14:15:00' AND captured_at_bkk <= '{trade_date} 16:55:05';",
         # 7. pragma page_count
         "PRAGMA page_count;",
         # 8. pragma page_size
@@ -887,6 +893,10 @@ LIMIT 1;""",
     stats["fut_bid"] = r3.get("bid")
     stats["fut_ask"] = r3.get("ask")
     stats["fut_oi"] = r3.get("open_interest") or 0.0
+
+    # If last traded price is None in r3, fall back to mid-price if bid and ask exist
+    if stats["fut_last"] is None and stats.get("fut_bid") is not None and stats.get("fut_ask") is not None:
+        stats["fut_last"] = round((stats["fut_bid"] + stats["fut_ask"]) / 2.0, 2)
 
     # 4. Options stats
     r4 = get_first_row(4)
@@ -938,18 +948,18 @@ LIMIT 1;""",
 def get_current_checkpoint(t: time) -> Optional[str]:
     """
     4-Checkpoint alert schedules:
-    1. MORNING_OPEN: 10:00 (10:00 - 12:31:59) - Active across morning session once market opens
-    2. MIDDAY_CLOSE: 12:32 (12:32 - 13:30) - Midday break report
-    3. AFTERNOON_OPEN: 14:30 (14:30 - 17:01:59) - Active across afternoon session once market opens
-    4. EVENING_CLOSE: 17:02 (17:02 - 18:30) - Full-day close summary
+    1. MORNING_OPEN: 10:00 (10:00 - 12:29:59) - Active across morning session once market opens
+    2. MIDDAY_CLOSE: 12:30 (12:30 - 13:30) - Midday break report
+    3. AFTERNOON_OPEN: 14:30 (14:30 - 16:54:59) - Active across afternoon session once market opens
+    4. EVENING_CLOSE: 16:55 (16:55 - 18:30) - Full-day close summary
     """
-    if time(10, 0) <= t < time(12, 32):
+    if time(10, 0) <= t < time(12, 30):
         return "MORNING_OPEN"
-    if time(12, 32) <= t <= time(13, 30):
+    if time(12, 30) <= t <= time(13, 30):
         return "MIDDAY_CLOSE"
-    if time(14, 30) <= t < time(17, 2):
+    if time(14, 30) <= t < time(16, 55):
         return "AFTERNOON_OPEN"
-    if time(17, 2) <= t <= time(18, 30):
+    if time(16, 55) <= t <= time(18, 30):
         return "EVENING_CLOSE"
     return None
 
@@ -1008,7 +1018,7 @@ def build_checkpoint_message(
     if checkpoint == "MORNING_OPEN":
         body = (
             f"🔔 <b>TFEX INTRADAY: MORNING OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:35)\n"
+            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:30)\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
             f"• <b>Bars Captured (Today):</b> <b>{spot_count}</b> bars\n"
@@ -1020,7 +1030,7 @@ def build_checkpoint_message(
         )
     elif checkpoint == "MIDDAY_CLOSE":
         m_pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
-        health = "🟢 Complete" if morning_bars >= 160 else "⚠️ Missing Bars"
+        health = "🟢 Complete" if m_pct >= 99.0 else f"🟡 Partial ({morning_bars}/165 bars)"
         body = (
             f"☕ <b>TFEX INTRADAY: MIDDAY BREAK REPORT</b>{mode_tag}\n\n"
             f"• <b>Status:</b> ⏸️ Morning Session Closed\n"
@@ -1037,7 +1047,7 @@ def build_checkpoint_message(
         warn = "\n⚠️ <b>Alert:</b> No bars captured yet for afternoon session!" if afternoon_bars == 0 else ""
         body = (
             f"📈 <b>TFEX INTRADAY: AFTERNOON OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 17:05)\n"
+            f"• <b>Status:</b> 🟢 Afternoon Session Active (14:15 - 16:55)\n"
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Afternoon Bars (since 14:15):</b> <b>{afternoon_bars}</b> bars\n"
             f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
@@ -1049,12 +1059,12 @@ def build_checkpoint_message(
     else:  # EVENING_CLOSE or MANUAL_REPORT
         total_expected = 325.0
         c_pct = (spot_count / total_expected) * 100.0 if spot_count else 0.0
-        if c_pct >= 98:
-            verdict = "✅ Excellent (≥98%)"
-        elif c_pct >= 90:
-            verdict = "⚠️ Good (≥90%)"
+        if c_pct >= 99.0:
+            verdict = "🟢 Complete (≥99%)"
+        elif c_pct >= 90.0:
+            verdict = f"🟡 Partial ({spot_count}/325 bars)"
         else:
-            verdict = f"🚨 Incomplete ({c_pct:.1f}%)"
+            verdict = f"🚨 Incomplete ({spot_count}/325 bars)"
 
         title = "🏁 <b>TFEX INTRADAY: FULL-DAY CLOSE SUMMARY</b>" if checkpoint == "EVENING_CLOSE" else "📊 <b>TFEX INTRADAY: CURRENT STATUS REPORT</b>"
         body = (
@@ -1063,8 +1073,8 @@ def build_checkpoint_message(
             f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
             f"• <b>Trading Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
             f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 325 ({c_pct:.1f}%)\n"
-            f"  - Morning (09:45-12:35): {morning_bars} bars\n"
-            f"  - Afternoon (14:15-17:05): {afternoon_bars} bars\n"
+            f"  - Morning (09:45-12:30): {morning_bars} bars\n"
+            f"  - Afternoon (14:15-16:55): {afternoon_bars} bars\n"
             f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
             f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
             f"• <b>API/DB Errors:</b> {err_str}\n"
@@ -1348,27 +1358,38 @@ class SettradeClientManager:
         vol = safe_float(data.get("total_volume")) or safe_float(data.get("volume")) or 0.0
 
         now_bkk = datetime.now(BANGKOK_TZ)
+        now_t = now_bkk.time()
+
+        # Cutoff guard: Do not record ticks outside trading hours (Morning: <= 12:30:05, Afternoon: <= 16:55:05)
+        if time(12, 30, 5) < now_t < time(14, 15) or now_t > time(16, 55, 5):
+            return
+
         ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
 
-        current_tick = {
-            "symbol": sym,
-            "bid": bid1 if (bid1 is not None and bid1 > 0) else None,
-            "ask": ask1 if (ask1 is not None and ask1 > 0) else None,
-            "bid_vol": bid_vol1,
-            "ask_vol": ask_vol1,
-            "last": last_p,
-            "volume": vol,
-            "captured_at_bkk": ts_str,
-            "updated_at": pytime.time()
-        }
-
         with self._cache_lock:
+            prev_state = self.coalesced_buffer.get(sym) or self.last_persisted_state.get(sym) or self.latest_market_state.get(sym)
+            if last_p is None and prev_state and prev_state.get("last") is not None:
+                last_p = prev_state["last"]
+            if vol == 0.0 and prev_state and prev_state.get("volume"):
+                vol = prev_state["volume"]
+
+            current_tick = {
+                "symbol": sym,
+                "bid": bid1 if (bid1 is not None and bid1 > 0) else None,
+                "ask": ask1 if (ask1 is not None and ask1 > 0) else None,
+                "bid_vol": bid_vol1,
+                "ask_vol": ask_vol1,
+                "last": last_p,
+                "volume": vol,
+                "captured_at_bkk": ts_str,
+                "updated_at": pytime.time()
+            }
+
             self.last_tick_time = pytime.time()
             self.cdc_stats["received"] += 1
             self.bid_offer_cache[sym] = current_tick
             self.latest_market_state[sym] = current_tick
 
-            prev_state = self.coalesced_buffer.get(sym) or self.last_persisted_state.get(sym)
             if is_tick_changed(prev_state, current_tick):
                 self.cdc_stats["changed"] += 1
                 # Coalescing: keep only latest state per symbol in this 3s window
@@ -1923,7 +1944,7 @@ def run_session_worker(
     if not session_cfg and not force:
         logger.info(
             f"[GUARD] Current time {now_bkk.strftime('%H:%M:%S')} is outside active session windows "
-            f"(Morning: 09:00 - 12:35, Afternoon: 13:00 - 17:05). Exiting gracefully (sys.exit(0))."
+            f"(Morning: 09:00 - 12:30, Afternoon: 13:00 - 16:55). Exiting gracefully (sys.exit(0))."
         )
         sys.exit(0)
 
@@ -1943,7 +1964,7 @@ def run_session_worker(
     logger.info(f"=== Starting TFEX Persistent Session Worker: {session_name} ===")
     logger.info(f"Market Open: {market_open_time.strftime('%H:%M:%S')} | Session End: {session_end_time.strftime('%H:%M:%S')}")
 
-    # Clear in-memory caches from previous sessions
+    # Clear in-memory caches from previous runs at initial startup
     settrade_mgr.clear_session_cache()
 
     # 3. Connect to Settrade Open API
@@ -1953,25 +1974,14 @@ def run_session_worker(
         logger.error(f"Cannot initialize Settrade Open API connection: {e}")
         sys.exit(1)
 
-    # 4. Pre-Market Wait if awakened before open time
-    if not force and now_bkk.time() < market_open_time:
-        wait_for_market_open(market_open_time, session_name)
-        settrade_mgr.clear_session_cache()
-
-    # Re-check Concurrency Guard after market open standby
-    now_bkk = datetime.now(BANGKOK_TZ)
-    if not force and is_worker_already_active(turso_pipeline_url, turso_token, now_bkk):
-        print("Another worker is already active. Exiting cleanly.")
-        logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
-        sys.exit(0)
-
-    # 5. Resolve active contracts & Ensure Turso Schema
+    # 4. Pre-warm: Ensure schema, resolve contracts, and subscribe ALL symbols to Realtime Pool
+    # Pre-warming runs immediately (before 09:44:30 / 14:14:30) to guarantee the WebSocket pool is 100% connected
     now_bkk = datetime.now(BANGKOK_TZ)
     ensure_database_schema(turso_pipeline_url, turso_token)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
-    logger.info(f"[SESSION] Active Series: Front={front_opt_series}, Next={next_opt_series}, Futures={futures_candidates}")
+    front_fut_symbol = f"S50{front_opt_series}"
+    logger.info(f"[SESSION] Active Series: Front={front_opt_series} ({front_fut_symbol}), Next={next_opt_series}, Futures={futures_candidates}")
 
-    # Subscribe ALL symbols across the entire board to Realtime Streaming Pool
     all_strikes = generate_all_active_strikes(920.0)
     all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
@@ -1979,7 +1989,7 @@ def run_session_worker(
         futures_candidates=futures_candidates,
         all_strikes=all_strikes
     )
-    logger.info(f"[SESSION] Subscribing {len(all_symbols)} symbols to Realtime Streaming Pool...")
+    logger.info(f"[PRE-WARM] Subscribing {len(all_symbols)} symbols across WebSocket pool before market open...")
     settrade_mgr.subscribe_symbols(all_symbols)
 
     stop_event = threading.Event()
@@ -2042,6 +2052,24 @@ def run_session_worker(
     flush_thread.start()
     watchdog_thread.start()
 
+    # 5. Pre-Market Standby: Wait precisely until market open time (:00 seconds)
+    now_bkk = datetime.now(BANGKOK_TZ)
+    if not force and now_bkk.time() < market_open_time:
+        logger.info(
+            f"[PRE-WARM] Pre-warm complete before {market_open_time.strftime('%H:%M:%S')}. "
+            f"WebSocket pool active ({len(settrade_mgr.realtime_connections)} conns, {len(settrade_mgr.subscribed_topics)} topics). "
+            f"Standing by for market open..."
+        )
+        wait_for_market_open(market_open_time, session_name)
+        # Note: Do NOT clear_session_cache() here so pre-warmed state is preserved for baseline!
+
+    # Re-check Concurrency Guard after market open standby
+    now_bkk = datetime.now(BANGKOK_TZ)
+    if not force and is_worker_already_active(turso_pipeline_url, turso_token, now_bkk):
+        print("Another worker is already active. Exiting cleanly.")
+        logger.info("[GUARD] Another worker is already active. Exiting cleanly (sys.exit(0)).")
+        sys.exit(0)
+
     market_verified = False
     session_error_count = 0
     triggered_baselines: Set[str] = set()
@@ -2053,10 +2081,17 @@ def run_session_worker(
         loop_now = datetime.now(BANGKOK_TZ)
         loop_time = loop_now.time()
 
-        # Check graceful exit condition
-        if not force and loop_time >= session_end_time:
-            logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
-            break
+        # Check cutoff / graceful exit condition (12:30:05 morning, 16:55:05 afternoon)
+        if not force:
+            if session_name == "MORNING" and loop_time >= time(12, 30, 5):
+                logger.info("[SESSION] Reached morning cutoff time (12:30:05). Stopping capture.")
+                break
+            elif session_name == "AFTERNOON" and loop_time >= time(16, 55, 5):
+                logger.info("[SESSION] Reached afternoon cutoff time (16:55:05). Stopping capture.")
+                break
+            elif loop_time >= session_end_time:
+                logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
+                break
 
         # Proactive token re-auth check
         try:
@@ -2064,7 +2099,7 @@ def run_session_worker(
         except Exception as e:
             logger.warning(f"[SETTRADE] Proactive auth refresh warning: {e}")
 
-        # 1-minute Spot capture (:00 second of every minute)
+        # 1-minute Spot & Front Futures Last Price capture (:00 second of every minute)
         if loop_now.minute != last_spot_minute and loop_now.second >= 0:
             last_spot_minute = loop_now.minute
             ts_str = loop_now.strftime("%Y-%m-%d %H:%M:%S")
@@ -2075,6 +2110,35 @@ def run_session_worker(
             except Exception as spot_err:
                 session_error_count += 1
                 logger.warning(f"[SPOT ERROR] Could not save SET50 Spot at {ts_str}: {spot_err}")
+
+            # Also refresh Front Month Futures last price & volume from quote
+            try:
+                fut_quote = settrade_mgr.market_data.get_quote_symbol(front_fut_symbol)
+                if fut_quote:
+                    fut_fields = extract_derivatives_data(fut_quote)
+                    if fut_fields.get("last") is not None:
+                        with settrade_mgr._cache_lock:
+                            st = settrade_mgr.latest_market_state.get(front_fut_symbol, {
+                                "symbol": front_fut_symbol,
+                                "captured_at_bkk": ts_str,
+                                "updated_at": pytime.time()
+                            })
+                            st["last"] = fut_fields["last"]
+                            if fut_fields.get("volume"):
+                                st["volume"] = fut_fields["volume"]
+                            if fut_fields.get("open_interest"):
+                                st["open_interest"] = fut_fields["open_interest"]
+                            settrade_mgr.latest_market_state[front_fut_symbol] = st
+
+                            if front_fut_symbol in settrade_mgr.coalesced_buffer:
+                                settrade_mgr.coalesced_buffer[front_fut_symbol]["last"] = fut_fields["last"]
+                                if fut_fields.get("volume"):
+                                    settrade_mgr.coalesced_buffer[front_fut_symbol]["volume"] = fut_fields["volume"]
+                            else:
+                                settrade_mgr.coalesced_buffer[front_fut_symbol] = dict(st)
+                                settrade_mgr.cdc_stats["changed"] += 1
+            except Exception as fut_err:
+                logger.debug(f"[FUTURES QUOTE] Could not refresh {front_fut_symbol} quote: {fut_err}")
 
         # Baseline Snapshot Trigger (09:45, 12:30, 14:15, 16:55 + 30-min heartbeats)
         h, m = loop_time.hour, loop_time.minute
@@ -2110,7 +2174,7 @@ def run_session_worker(
             check_holiday_early_exit(settrade_mgr.market_data, front_opt_series, loop_now)
             market_verified = True
 
-        # Telegram 4-checkpoint alerts evaluation (10:00, 12:30, 14:30, 17:00)
+        # Telegram 4-checkpoint alerts evaluation (10:00, 12:30, 14:30, 16:55)
         if telegram_bot_token and telegram_chat_id:
             try:
                 check_and_send_checkpoints(
@@ -2134,6 +2198,18 @@ def run_session_worker(
     except Exception as fe:
         logger.warning(f"[TEARDOWN] Final flush error: {fe}")
     settrade_mgr.stop_all_realtime()
+
+    # Trigger final session checkpoint alert (MIDDAY_CLOSE or EVENING_CLOSE) if configured
+    if telegram_bot_token and telegram_chat_id:
+        try:
+            check_and_send_checkpoints(
+                datetime.now(BANGKOK_TZ), turso_pipeline_url, turso_token,
+                telegram_bot_token, telegram_chat_id, force_notify=False,
+                session_errors=session_error_count,
+                cdc_stats=settrade_mgr.cdc_stats
+            )
+        except Exception as e:
+            logger.warning(f"[TELEGRAM] Teardown checkpoint alert error: {e}")
 
     logger.info(
         f"=== Session Worker Completed Successfully: {session_name} ===\n"
@@ -2282,7 +2358,7 @@ def main() -> None:
     parser.add_argument(
         "--session",
         action="store_true",
-        help="Run persistent 1-minute session worker loop until session closes (Morning: 09:45-12:35, Afternoon: 14:15-17:05)."
+        help="Run persistent 1-minute session worker loop until session closes (Morning: 09:45-12:30, Afternoon: 14:15-16:55)."
     )
     parser.add_argument(
         "--once",
