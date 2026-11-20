@@ -776,9 +776,9 @@ def record_telegram_notification(
 
 
 def has_intraday_data_for_date(pipeline_url: str, auth_token: str, trade_date: str) -> bool:
-    sql = f"SELECT COUNT(*) as cnt FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';"
+    sql = "SELECT COUNT(*) as cnt FROM spot_snapshots WHERE captured_at_bkk LIKE ?;"
     reqs = [
-        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "execute", "stmt": {"sql": sql, "args": [to_turso_arg(f"{trade_date}%")]}},
         {"type": "close"}
     ]
     try:
@@ -799,15 +799,15 @@ def is_worker_already_active(pipeline_url: str, auth_token: str, now_bkk: dateti
     Prevents duplicate concurrent workers (e.g. backup cron trigger while primary is running).
     """
     today_str = now_bkk.strftime("%Y-%m-%d")
-    sql = f"""
+    sql = """
     SELECT captured_at_bkk 
     FROM futures_snapshots 
-    WHERE captured_at_bkk LIKE '{today_str}%' 
+    WHERE captured_at_bkk LIKE ? 
     ORDER BY captured_at_bkk DESC 
     LIMIT 1;
     """
     reqs = [
-        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "execute", "stmt": {"sql": sql, "args": [to_turso_arg(f"{today_str}%")]}},
         {"type": "close"}
     ]
     try:
@@ -856,37 +856,59 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
     cand_fut, front_opt, _ = resolve_active_series_candidates(dt)
     front_fut_symbol = f"S50{front_opt}"
 
-    sql_queries = [
+    like_prefix = to_turso_arg(f"{trade_date}%")
+    morning_from = to_turso_arg(f"{trade_date} 09:45:00")
+    morning_to = to_turso_arg(f"{trade_date} 12:30:05")
+    afternoon_from = to_turso_arg(f"{trade_date} 13:45:00")
+    afternoon_to = to_turso_arg(f"{trade_date} 16:55:05")
+    date_arg = to_turso_arg(trade_date)
+    front_fut_arg = to_turso_arg(front_fut_symbol)
+
+    # Every value is bound (?) rather than interpolated: these dates come from the
+    # clock or from a value read back out of the database, and a single quote in
+    # either would have rewritten the query.
+    sql_queries: List[Tuple[str, List[Dict[str, Any]]]] = [
         # 0. spot stats
-        f"SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        ("SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts "
+         "FROM spot_snapshots WHERE captured_at_bkk LIKE ?;", [like_prefix]),
         # 1. latest spot
-        f"SELECT last, volume, value, captured_at_bkk FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC LIMIT 1;",
+        ("SELECT last, volume, value, captured_at_bkk FROM spot_snapshots "
+         "WHERE captured_at_bkk LIKE ? ORDER BY captured_at_bkk DESC LIMIT 1;", [like_prefix]),
         # 2. futures stats
-        f"SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
-        # 3. latest front futures (Prioritize Front Quarter series e.g. S50Z26, and valid last price)
-        f"""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk 
-FROM futures_snapshots 
-WHERE captured_at_bkk LIKE '{trade_date}%' 
-ORDER BY (CASE WHEN symbol = '{front_fut_symbol}' AND last IS NOT NULL AND last > 0 THEN 3
-               WHEN symbol = '{front_fut_symbol}' THEN 2
+        ("SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots "
+         "WHERE captured_at_bkk LIKE ?;", [like_prefix]),
+        # 3. latest front futures (front quarter series first, then any valid last price)
+        ("""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk
+FROM futures_snapshots
+WHERE captured_at_bkk LIKE ?
+ORDER BY (CASE WHEN symbol = ? AND last IS NOT NULL AND last > 0 THEN 3
+               WHEN symbol = ? THEN 2
                WHEN last IS NOT NULL AND last > 0 THEN 1 ELSE 0 END) DESC,
-         captured_at_bkk DESC 
-LIMIT 1;""",
+         captured_at_bkk DESC
+LIMIT 1;""", [like_prefix, front_fut_arg, front_fut_arg]),
         # 4. options stats
-        f"SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        ("SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots "
+         "WHERE captured_at_bkk LIKE ?;", [like_prefix]),
         # 5. morning bars
-        f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:30:05';",
+        ("SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning "
+         "FROM spot_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;",
+         [morning_from, morning_to]),
         # 6. afternoon bars
-        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 13:45:00' AND captured_at_bkk <= '{trade_date} 16:55:05';",
+        ("SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon "
+         "FROM spot_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;",
+         [afternoon_from, afternoon_to]),
         # 7. pragma page_count
-        "PRAGMA page_count;",
+        ("PRAGMA page_count;", []),
         # 8. pragma page_size
-        "PRAGMA page_size;",
+        ("PRAGMA page_size;", []),
         # 9. tick errors count
-        f"SELECT COUNT(*) as err_count FROM intraday_tick_errors WHERE trade_date = '{trade_date}';"
+        ("SELECT COUNT(*) as err_count FROM intraday_tick_errors WHERE trade_date = ?;", [date_arg]),
     ]
 
-    reqs = [{"type": "execute", "stmt": {"sql": s}} for s in sql_queries]
+    reqs = [
+        {"type": "execute", "stmt": ({"sql": sql, "args": args} if args else {"sql": sql})}
+        for sql, args in sql_queries
+    ]
     reqs.append({"type": "close"})
 
     results = query_turso_pipeline(pipeline_url, auth_token, reqs)

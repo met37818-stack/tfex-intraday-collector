@@ -491,3 +491,47 @@ class TestSessionTickGuard(unittest.TestCase):
         self.assertTrue(is_tick_within_session(t(13, 45)))
         self.assertTrue(is_tick_within_session(t(16, 55, 5)))
         self.assertFalse(is_tick_within_session(t(16, 55, 6)))
+
+
+class TestSqlParameterisation(unittest.TestCase):
+    """Dates must be bound, never interpolated into the SQL text."""
+
+    DATE = "2026-11-20"
+
+    @patch("collector.query_turso_pipeline")
+    def test_stat_queries_bind_every_date(self, mock_query):
+        from collector import query_turso_intraday_stats
+
+        mock_query.return_value = []
+        query_turso_intraday_stats("https://dummy/v2/pipeline", "tok", self.DATE)
+
+        stmts = [r["stmt"] for r in mock_query.call_args[0][2] if r["type"] == "execute"]
+        self.assertTrue(stmts)
+        for stmt in stmts:
+            self.assertNotIn(self.DATE, stmt["sql"], f"date interpolated into SQL: {stmt['sql'][:60]}")
+            if stmt["sql"].startswith("PRAGMA"):
+                continue
+            self.assertIn("?", stmt["sql"])
+            self.assertTrue(stmt.get("args"), f"no bound args for: {stmt['sql'][:60]}")
+
+    @patch("collector.query_turso_pipeline")
+    def test_intraday_data_check_binds_date(self, mock_query):
+        from collector import has_intraday_data_for_date
+
+        mock_query.return_value = []
+        has_intraday_data_for_date("https://dummy/v2/pipeline", "tok", self.DATE)
+
+        stmt = mock_query.call_args[0][2][0]["stmt"]
+        self.assertNotIn(self.DATE, stmt["sql"])
+        self.assertEqual(stmt["args"][0], {"type": "text", "value": f"{self.DATE}%"})
+
+    @patch("collector.query_turso_pipeline")
+    def test_worker_active_check_binds_date(self, mock_query):
+        from collector import is_worker_already_active
+
+        mock_query.return_value = []
+        is_worker_already_active("https://dummy/v2/pipeline", "tok", datetime(2026, 11, 20, 10, 0, tzinfo=BANGKOK_TZ))
+
+        stmt = mock_query.call_args[0][2][0]["stmt"]
+        self.assertNotIn(self.DATE, stmt["sql"])
+        self.assertEqual(stmt["args"][0], {"type": "text", "value": f"{self.DATE}%"})
