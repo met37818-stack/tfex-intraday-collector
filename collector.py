@@ -20,7 +20,7 @@ import calendar
 import logging
 import threading
 from datetime import datetime, time, date, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
@@ -49,6 +49,15 @@ logging.getLogger("settrade_v2").setLevel(logging.CRITICAL + 1)
 # Timezone constant
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
 
+# Strike grid used to address the SET50 option board. Deliberately wide: the
+# worker subscribes to everything and lets unlisted strikes answer "not found",
+# so a stale grid only costs a few wasted subscriptions.
+STRIKE_STEP = 10
+STRIKE_MIN = 750
+STRIKE_MAX = 1350
+STRIKE_ATM_RANGE = 250
+DEFAULT_ATM_BASE = 920.0
+
 # TFEX Month code mapping
 MONTH_CODES = {
     1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
@@ -58,6 +67,8 @@ QUARTERLY_MONTHS = {3, 6, 9, 12}  # H, M, U, Z
 
 # ==============================================================================
 # SET / TFEX Official Exchange Holidays (2026 - 2027)
+# NOTE: keep in sync with tfex-eod-collector/calendar_utils.py. The two repos must
+# agree on this set, or one collects on a day the other skips.
 # ==============================================================================
 SET_HOLIDAYS = {
     # 2026
@@ -137,23 +148,40 @@ def _market_data_ratelimit_init(self, *args, **kwargs):
     self.remaining_per_second = 60
     self.rate_per_minute = 3600
     self.remaining_per_minute = 3600
-RateLimit.__init__ = _market_data_ratelimit_init
+try:
+    RateLimit.__init__ = _market_data_ratelimit_init
+except Exception as patch_err:  # pragma: no cover - depends on SDK internals
+    logger.warning(f"[SETTRADE] Could not patch RateLimit defaults: {patch_err}")
 
-# 2. Patch settrade_v2 with persistent requests.Session for HTTP Keep-Alive connection reuse
-_http_session = requests.Session()
+# 2. Patch settrade_v2 with a persistent requests.Session per thread for
+#    HTTP Keep-Alive connection reuse.
+#    Session is not thread-safe (its connection pool is shared mutable state),
+#    and option quotes are fetched through ThreadPoolExecutor(max_workers=N);
+#    a single shared session raced across those workers.
 _http_adapter = requests.adapters.HTTPAdapter(
     pool_connections=25,
     pool_maxsize=25,
     max_retries=1
 )
-_http_session.mount("https://", _http_adapter)
-_http_session.mount("http://", _http_adapter)
+_thread_local = threading.local()
 
-st_context.request = lambda method, url, **kwargs: _http_session.request(
-    method=method,
-    url=url,
-    **kwargs
-)
+
+def _http_session() -> requests.Session:
+    """One requests.Session per thread, sharing the tuned connection pool adapter."""
+    session = getattr(_thread_local, "http", None)
+    if session is None:
+        session = requests.Session()
+        session.mount("https://", _http_adapter)
+        session.mount("http://", _http_adapter)
+        _thread_local.http = session
+    return session
+
+
+def _patched_request(method: str, url: str, **kwargs):
+    return _http_session().request(method=method, url=url, **kwargs)
+
+
+st_context.request = _patched_request
 
 
 class PacedRateLimiter:
@@ -190,6 +218,16 @@ def detect_session_window(now_bkk: datetime) -> Optional[Dict[str, Any]]:
     if time(13, 0) <= curr_t <= time(16, 55, 10):
         return SESSION_CONFIG["AFTERNOON"]
     return None
+
+
+def is_tick_within_session(now_t: time) -> bool:
+    """True only inside a continuous session: 09:45:00-12:30:05 or 13:45:00-16:55:05.
+
+    The previous guard only rejected the lunch break and everything after
+    16:55:05, so ticks arriving during the 09:00-09:44 pre-open window were
+    recorded as snapshots.
+    """
+    return (time(9, 45) <= now_t <= time(12, 30, 5)) or (time(13, 45) <= now_t <= time(16, 55, 5))
 
 
 def is_within_trading_hours(dt: datetime) -> Tuple[bool, str]:
@@ -276,16 +314,16 @@ def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
     Generates all active strike prices covering the entire TFEX trading board.
     Uses 10-point increments, covering 750 to 1350 and ATM ± 250 points.
     """
-    min_strike = 750
-    max_strike = 1350
+    min_strike = STRIKE_MIN
+    max_strike = STRIKE_MAX
     if atm_base and atm_base > 0:
-        atm_strike = round(atm_base / 10.0) * 10.0
-        min_strike = min(min_strike, int(atm_strike - 250))
-        max_strike = max(max_strike, int(atm_strike + 250))
+        atm_strike = round(atm_base / float(STRIKE_STEP)) * STRIKE_STEP
+        min_strike = min(min_strike, int(atm_strike - STRIKE_ATM_RANGE))
+        max_strike = max(max_strike, int(atm_strike + STRIKE_ATM_RANGE))
 
-    min_strike = int(min_strike // 10 * 10)
-    max_strike = int(max_strike // 10 * 10)
-    return list(range(min_strike, max_strike + 10, 10))
+    min_strike = int(min_strike // STRIKE_STEP * STRIKE_STEP)
+    max_strike = int(max_strike // STRIKE_STEP * STRIKE_STEP)
+    return list(range(min_strike, max_strike + STRIKE_STEP, STRIKE_STEP))
 
 
 def generate_all_stream_symbols(
@@ -381,8 +419,66 @@ def to_turso_arg(val: Any) -> Dict[str, Any]:
     if isinstance(val, int):
         return {"type": "integer", "value": str(val)}
     if isinstance(val, float):
+        if val != val or val in (float("inf"), float("-inf")):  # NaN / Inf
+            return {"type": "null"}
         return {"type": "float", "value": val}
     return {"type": "text", "value": str(val)}
+
+
+# ==============================================================================
+# Turso schema (created idempotently on every batch write)
+# ==============================================================================
+ddl_spot = """
+CREATE TABLE IF NOT EXISTS spot_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    last REAL,
+    volume REAL,
+    value REAL
+);
+"""
+ddl_futures = """
+CREATE TABLE IF NOT EXISTS futures_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    bid_vol REAL,
+    ask_vol REAL,
+    last REAL,
+    volume REAL,
+    open_interest REAL
+);
+"""
+ddl_options = """
+CREATE TABLE IF NOT EXISTS options_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    series TEXT NOT NULL,
+    strike REAL NOT NULL,
+    option_type TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    bid_vol REAL,
+    ask_vol REAL,
+    last REAL,
+    volume REAL,
+    open_interest REAL
+);
+"""
+ddl_telegram_log = """
+CREATE TABLE IF NOT EXISTS intraday_telegram_log (
+    trade_date TEXT NOT NULL,
+    checkpoint TEXT NOT NULL,
+    notified_at_bkk TEXT NOT NULL,
+    PRIMARY KEY (trade_date, checkpoint)
+);
+"""
+
+DDL_STATEMENTS: List[str] = [ddl_spot, ddl_futures, ddl_options, ddl_telegram_log]
 
 
 def build_turso_pipeline_payload(
@@ -392,56 +488,7 @@ def build_turso_pipeline_payload(
 ) -> Dict[str, Any]:
     requests_list: List[Dict[str, Any]] = []
 
-    ddl_spot = """
-    CREATE TABLE IF NOT EXISTS spot_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        last REAL,
-        volume REAL,
-        value REAL
-    );
-    """
-    ddl_futures = """
-    CREATE TABLE IF NOT EXISTS futures_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        bid REAL,
-        ask REAL,
-        bid_vol REAL,
-        ask_vol REAL,
-        last REAL,
-        volume REAL,
-        open_interest REAL
-    );
-    """
-    ddl_options = """
-    CREATE TABLE IF NOT EXISTS options_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        series TEXT NOT NULL,
-        strike REAL NOT NULL,
-        option_type TEXT NOT NULL,
-        bid REAL,
-        ask REAL,
-        bid_vol REAL,
-        ask_vol REAL,
-        last REAL,
-        volume REAL,
-        open_interest REAL
-    );
-    """
-    ddl_telegram_log = """
-    CREATE TABLE IF NOT EXISTS intraday_telegram_log (
-        trade_date TEXT NOT NULL,
-        checkpoint TEXT NOT NULL,
-        notified_at_bkk TEXT NOT NULL,
-        PRIMARY KEY (trade_date, checkpoint)
-    );
-    """
-    for ddl in [ddl_spot, ddl_futures, ddl_options, ddl_telegram_log]:
+    for ddl in DDL_STATEMENTS:
         requests_list.append({
             "type": "execute",
             "stmt": {"sql": ddl.strip()}
@@ -521,7 +568,7 @@ def execute_turso_pipeline(pipeline_url: str, auth_token: str, payload: Dict[str
     }
 
     try:
-        response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=30)
+        response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=30)
     except requests.exceptions.RequestException as e:
         logger.error(f"Turso network connection failed: {e}")
         raise
@@ -638,7 +685,7 @@ def query_turso_pipeline(pipeline_url: str, auth_token: str, requests_list: List
         "Content-Type": "application/json"
     }
     payload = {"requests": requests_list}
-    response = _http_session.post(pipeline_url, json=payload, headers=headers, timeout=20)
+    response = _http_session().post(pipeline_url, json=payload, headers=headers, timeout=20)
     if response.status_code != 200:
         sanitized = response.text.replace(auth_token, "***")
         raise RuntimeError(f"Turso HTTP {response.status_code}: {sanitized}")
@@ -752,9 +799,9 @@ def record_telegram_notification(
 
 
 def has_intraday_data_for_date(pipeline_url: str, auth_token: str, trade_date: str) -> bool:
-    sql = f"SELECT COUNT(*) as cnt FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';"
+    sql = "SELECT COUNT(*) as cnt FROM spot_snapshots WHERE captured_at_bkk LIKE ?;"
     reqs = [
-        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "execute", "stmt": {"sql": sql, "args": [to_turso_arg(f"{trade_date}%")]}},
         {"type": "close"}
     ]
     try:
@@ -775,15 +822,15 @@ def is_worker_already_active(pipeline_url: str, auth_token: str, now_bkk: dateti
     Prevents duplicate concurrent workers (e.g. backup cron trigger while primary is running).
     """
     today_str = now_bkk.strftime("%Y-%m-%d")
-    sql = f"""
+    sql = """
     SELECT captured_at_bkk 
     FROM futures_snapshots 
-    WHERE captured_at_bkk LIKE '{today_str}%' 
+    WHERE captured_at_bkk LIKE ? 
     ORDER BY captured_at_bkk DESC 
     LIMIT 1;
     """
     reqs = [
-        {"type": "execute", "stmt": {"sql": sql}},
+        {"type": "execute", "stmt": {"sql": sql, "args": [to_turso_arg(f"{today_str}%")]}},
         {"type": "close"}
     ]
     try:
@@ -832,37 +879,59 @@ def query_turso_intraday_stats(pipeline_url: str, auth_token: str, trade_date: s
     cand_fut, front_opt, _ = resolve_active_series_candidates(dt)
     front_fut_symbol = f"S50{front_opt}"
 
-    sql_queries = [
+    like_prefix = to_turso_arg(f"{trade_date}%")
+    morning_from = to_turso_arg(f"{trade_date} 09:45:00")
+    morning_to = to_turso_arg(f"{trade_date} 12:30:05")
+    afternoon_from = to_turso_arg(f"{trade_date} 13:45:00")
+    afternoon_to = to_turso_arg(f"{trade_date} 16:55:05")
+    date_arg = to_turso_arg(trade_date)
+    front_fut_arg = to_turso_arg(front_fut_symbol)
+
+    # Every value is bound (?) rather than interpolated: these dates come from the
+    # clock or from a value read back out of the database, and a single quote in
+    # either would have rewritten the query.
+    sql_queries: List[Tuple[str, List[Dict[str, Any]]]] = [
         # 0. spot stats
-        f"SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        ("SELECT COUNT(*) as spot_count, MIN(captured_at_bkk) as min_ts, MAX(captured_at_bkk) as max_ts "
+         "FROM spot_snapshots WHERE captured_at_bkk LIKE ?;", [like_prefix]),
         # 1. latest spot
-        f"SELECT last, volume, value, captured_at_bkk FROM spot_snapshots WHERE captured_at_bkk LIKE '{trade_date}%' ORDER BY captured_at_bkk DESC LIMIT 1;",
+        ("SELECT last, volume, value, captured_at_bkk FROM spot_snapshots "
+         "WHERE captured_at_bkk LIKE ? ORDER BY captured_at_bkk DESC LIMIT 1;", [like_prefix]),
         # 2. futures stats
-        f"SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
-        # 3. latest front futures (Prioritize Front Quarter series e.g. S50Z26, and valid last price)
-        f"""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk 
-FROM futures_snapshots 
-WHERE captured_at_bkk LIKE '{trade_date}%' 
-ORDER BY (CASE WHEN symbol = '{front_fut_symbol}' AND last IS NOT NULL AND last > 0 THEN 3
-               WHEN symbol = '{front_fut_symbol}' THEN 2
+        ("SELECT COUNT(*) as fut_count, COUNT(DISTINCT symbol) as fut_syms FROM futures_snapshots "
+         "WHERE captured_at_bkk LIKE ?;", [like_prefix]),
+        # 3. latest front futures (front quarter series first, then any valid last price)
+        ("""SELECT symbol, last, bid, ask, volume, open_interest, captured_at_bkk
+FROM futures_snapshots
+WHERE captured_at_bkk LIKE ?
+ORDER BY (CASE WHEN symbol = ? AND last IS NOT NULL AND last > 0 THEN 3
+               WHEN symbol = ? THEN 2
                WHEN last IS NOT NULL AND last > 0 THEN 1 ELSE 0 END) DESC,
-         captured_at_bkk DESC 
-LIMIT 1;""",
+         captured_at_bkk DESC
+LIMIT 1;""", [like_prefix, front_fut_arg, front_fut_arg]),
         # 4. options stats
-        f"SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots WHERE captured_at_bkk LIKE '{trade_date}%';",
+        ("SELECT COUNT(*) as opt_count, COUNT(DISTINCT symbol) as opt_syms FROM options_snapshots "
+         "WHERE captured_at_bkk LIKE ?;", [like_prefix]),
         # 5. morning bars
-        f"SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 09:45:00' AND captured_at_bkk <= '{trade_date} 12:30:05';",
+        ("SELECT COUNT(*) as morning_bars, MIN(captured_at_bkk) as min_morning, MAX(captured_at_bkk) as max_morning "
+         "FROM spot_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;",
+         [morning_from, morning_to]),
         # 6. afternoon bars
-        f"SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon FROM spot_snapshots WHERE captured_at_bkk >= '{trade_date} 13:45:00' AND captured_at_bkk <= '{trade_date} 16:55:05';",
+        ("SELECT COUNT(*) as afternoon_bars, MIN(captured_at_bkk) as min_afternoon, MAX(captured_at_bkk) as max_afternoon "
+         "FROM spot_snapshots WHERE captured_at_bkk >= ? AND captured_at_bkk <= ?;",
+         [afternoon_from, afternoon_to]),
         # 7. pragma page_count
-        "PRAGMA page_count;",
+        ("PRAGMA page_count;", []),
         # 8. pragma page_size
-        "PRAGMA page_size;",
+        ("PRAGMA page_size;", []),
         # 9. tick errors count
-        f"SELECT COUNT(*) as err_count FROM intraday_tick_errors WHERE trade_date = '{trade_date}';"
+        ("SELECT COUNT(*) as err_count FROM intraday_tick_errors WHERE trade_date = ?;", [date_arg]),
     ]
 
-    reqs = [{"type": "execute", "stmt": {"sql": s}} for s in sql_queries]
+    reqs = [
+        {"type": "execute", "stmt": ({"sql": sql, "args": args} if args else {"sql": sql})}
+        for sql, args in sql_queries
+    ]
     reqs.append({"type": "close"})
 
     results = query_turso_pipeline(pipeline_url, auth_token, reqs)
@@ -1138,16 +1207,18 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
         "disable_web_page_preview": True
     }
     try:
-        resp = _http_session.post(url, json=payload, timeout=15)
-        logger.info(f"[TELEGRAM] HTTP Status: {resp.status_code} | API Response: {resp.text}")
+        resp = _http_session().post(url, json=payload, timeout=15)
         if resp.status_code == 200 and resp.json().get("ok"):
-            logger.info("Telegram alert sent successfully.")
+            logger.info(f"[TELEGRAM] Delivered successfully (HTTP {resp.status_code}).")
             return True
-        else:
-            logger.error(f"Telegram API returned status {resp.status_code}: {resp.text}")
-            return False
-    except Exception as e:
-        logger.error(f"Failed to deliver Telegram message: {e}")
+        # The response body is a Telegram error envelope; the URL (which carries
+        # the bot token) is never logged.
+        logger.error(f"[TELEGRAM] API rejected the message (HTTP {resp.status_code}): {(resp.text or '')[:200]}")
+        return False
+    except requests.RequestException as exc:
+        # requests embeds the full URL — including /bot<token>/ — in its own
+        # exception messages, so only the exception type is logged.
+        logger.error(f"[TELEGRAM] Delivery failed: {type(exc).__name__}")
         return False
 
 
@@ -1279,6 +1350,10 @@ class SettradeClientManager:
         self.subscribed_topics: Set[str] = set()
         self._cache_lock = threading.Lock()
         self.last_auth_time: float = 0.0
+        # Symbol whose ticks are echoed to the log (the front future). Set by the
+        # session worker once the active series is resolved, instead of hardcoding
+        # a season code that goes stale at every rollover.
+        self.debug_log_symbol: Optional[str] = None
 
         # Change Data Capture (CDC) State & Coalescing Buffer
         self.latest_market_state: Dict[str, Dict[str, Any]] = {}
@@ -1310,7 +1385,11 @@ class SettradeClientManager:
         with self._cache_lock:
             for conn in self.realtime_connections:
                 try:
-                    conn._stop()
+                    # The SDK only exposes the private _stop(); prefer a public
+                    # name if a future version adds one.
+                    stopper = getattr(conn, "stop", None) or getattr(conn, "_stop", None)
+                    if callable(stopper):
+                        stopper()
                 except Exception:
                     pass
             self.realtime_connections.clear()
@@ -1367,8 +1446,8 @@ class SettradeClientManager:
         now_bkk = datetime.now(BANGKOK_TZ)
         now_t = now_bkk.time()
 
-        # Cutoff guard: Do not record ticks outside trading hours (Morning: <= 12:30:05, Afternoon: <= 16:55:05)
-        if time(12, 30, 5) < now_t < time(13, 45) or now_t > time(16, 55, 5):
+        # Session guard: record ticks only inside the two continuous sessions
+        if not is_tick_within_session(now_t):
             return
 
         ts_str = now_bkk.strftime("%Y-%m-%d %H:%M:%S")
@@ -1404,7 +1483,7 @@ class SettradeClientManager:
             else:
                 self.cdc_stats["deduped"] += 1
 
-        if sym.startswith("S50Z26") and not sym.startswith("S50Z26C") and not sym.startswith("S50Z26P"):
+        if self.debug_log_symbol and sym == self.debug_log_symbol:
             logger.info(f"[REALTIME STREAM] {sym}: Bid={bid1} (Vol={bid_vol1}), Ask={ask1} (Vol={ask_vol1})")
 
     def subscribe_symbols(self, symbols: List[str], max_per_conn: int = 35) -> None:
@@ -1481,7 +1560,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": None
+                        "open_interest": it.get("open_interest")
                     })
                 else:
                     options_rows.append({
@@ -1496,7 +1575,7 @@ class SettradeClientManager:
                         "ask_vol": it["ask_vol"],
                         "last": it["last"],
                         "volume": it["volume"],
-                        "open_interest": None
+                        "open_interest": it.get("open_interest")
                     })
             else:
                 futures_rows.append({
@@ -1508,7 +1587,7 @@ class SettradeClientManager:
                     "ask_vol": it["ask_vol"],
                     "last": it["last"],
                     "volume": it["volume"],
-                    "open_interest": None
+                    "open_interest": it.get("open_interest")
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1559,7 +1638,7 @@ class SettradeClientManager:
                         "ask_vol": row.get("ask_vol", 0.0),
                         "last": row.get("last"),
                         "volume": row.get("volume", 0.0),
-                        "open_interest": None
+                        "open_interest": row.get("open_interest")
                     })
             else:
                 futures_rows.append({
@@ -1571,7 +1650,7 @@ class SettradeClientManager:
                     "ask_vol": row.get("ask_vol", 0.0),
                     "last": row.get("last"),
                     "volume": row.get("volume", 0.0),
-                    "open_interest": None
+                    "open_interest": row.get("open_interest")
                 })
 
         save_cdc_batch_to_turso(turso_pipeline_url, turso_token, futures_rows, options_rows)
@@ -1652,9 +1731,10 @@ def fetch_option_quote_task(
                 "open_interest": fields["open_interest"]
             }
     except SettradeError:
+        # Unlisted strike / instrument not traded today: expected, not a failure.
         return None
     except Exception as e:
-        logger.debug(f"Option fetch error for {symbol}: {e}")
+        logger.warning(f"Option fetch error for {symbol}: {type(e).__name__}: {e}")
         return None
     return None
 
@@ -1743,7 +1823,7 @@ def collect_and_save_snapshot(
             logger.warning(f"Error querying futures symbol {symbol}: {e}")
 
     # 3. Fetch SET50 Options for All Active Strikes (Front & Next Series)
-    atm_base = spot_price_ref or front_futures_price or 900.0
+    atm_base = spot_price_ref or front_futures_price or DEFAULT_ATM_BASE
     all_strikes = generate_all_active_strikes(atm_base)
 
     # Subscribe ALL candidate symbols across the entire board to Realtime Streaming Pool
@@ -1869,12 +1949,16 @@ def check_holiday_early_exit(market_data: Any, front_opt_series: str, now_bkk: d
                     pass
 
                 if not spot_has_today:
-                    logger.info(
-                        f"[GUARD] Holiday / Inactive Market Detected: 10 minutes past market open ({now_bkk.strftime('%H:%M:%S')}). "
-                        f"Latest candlestick date for {front_fut_symbol} is {candle_dt.date()} (< {today_date}). "
-                        f"No market trades recorded today. Exiting session worker gracefully (sys.exit(0))."
+                    # Exit 3, not 0: the calendar already ruled out a scheduled
+                    # holiday, so "no trades today" is either an unscheduled
+                    # closure or a data outage. Both need a human to look, and a
+                    # zero exit reported the run as successful either way.
+                    logger.error(
+                        f"[GUARD] Market inactive 10 minutes after open ({now_bkk.strftime('%H:%M:%S')}): "
+                        f"latest candle for {front_fut_symbol} is {candle_dt.date()} (< {today_date}) and "
+                        f"SET50 has no candle today. Exiting with code 3 (unscheduled closure or data outage)."
                     )
-                    sys.exit(0)
+                    sys.exit(3)
 
             logger.info(
                 f"[GUARD] Live market verified: Latest 1m candle for {front_fut_symbol} is "
@@ -1955,6 +2039,7 @@ def run_session_worker(
         )
         sys.exit(0)
 
+    forced_session_deadline: Optional[datetime] = None
     if session_cfg:
         session_name = session_cfg["name"]
         market_open_time = session_cfg["market_open"]
@@ -1966,7 +2051,12 @@ def run_session_worker(
         market_open_time = now_bkk.time()
         verify_holiday_time = time(23, 59, 59)
         session_end_time = (now_bkk + timedelta(minutes=10)).time()
-        logger.info(f"[SESSION] Running forced ad-hoc session until {session_end_time.strftime('%H:%M:%S')}")
+        # A .time() comparison wraps at midnight; compare datetimes instead.
+        forced_session_deadline = now_bkk + timedelta(minutes=10)
+        logger.info(
+        f"[SESSION] Running forced ad-hoc session until "
+        f"{(forced_session_deadline or now_bkk).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
     logger.info(f"=== Starting TFEX Persistent Session Worker: {session_name} ===")
     logger.info(f"Market Open: {market_open_time.strftime('%H:%M:%S')} | Session End: {session_end_time.strftime('%H:%M:%S')}")
@@ -1987,9 +2077,10 @@ def run_session_worker(
     ensure_database_schema(turso_pipeline_url, turso_token)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
     front_fut_symbol = f"S50{front_opt_series}"
+    settrade_mgr.debug_log_symbol = front_fut_symbol
     logger.info(f"[SESSION] Active Series: Front={front_opt_series} ({front_fut_symbol}), Next={next_opt_series}, Futures={futures_candidates}")
 
-    all_strikes = generate_all_active_strikes(920.0)
+    all_strikes = generate_all_active_strikes(DEFAULT_ATM_BASE)
     all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
         next_series=next_opt_series,
@@ -2096,7 +2187,13 @@ def run_session_worker(
             elif session_name == "AFTERNOON" and loop_time >= time(16, 55, 5):
                 logger.info("[SESSION] Reached afternoon cutoff time (16:55:05). Stopping capture.")
                 break
-            elif loop_time >= session_end_time:
+            elif forced_session_deadline is not None and loop_now >= forced_session_deadline:
+                logger.info(
+                    f"[SESSION] Reached forced session deadline "
+                    f"({forced_session_deadline.strftime('%Y-%m-%d %H:%M:%S')}). Exiting gracefully."
+                )
+                break
+            elif session_cfg is not None and loop_time >= session_end_time:
                 logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
                 break
 
@@ -2257,7 +2354,7 @@ def run_single_snapshot(
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
 
     # Pre-subscribe ALL symbols across the entire board to Realtime Streaming Pool
-    all_strikes = generate_all_active_strikes(920.0)
+    all_strikes = generate_all_active_strikes(DEFAULT_ATM_BASE)
     all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
         next_series=next_opt_series,
@@ -2330,12 +2427,47 @@ def load_dotenv_simple(env_path: str = ".env") -> None:
             logger.warning(f"Could not read .env file: {e}")
 
 
+def clean_mode_guard(clean: bool, confirm_clean: bool) -> Optional[str]:
+    """Reason `--clean` must be refused, or None when it is explicitly confirmed.
+
+    --clean runs `DELETE FROM ...` with no WHERE clause against three tables;
+    it used to be reachable from the workflow dispatch dropdown (one click away
+    from `session`) with no confirmation step at all.
+    """
+    if not clean:
+        return None
+    if confirm_clean:
+        return None
+    return (
+        "--clean deletes EVERY row in options_snapshots, futures_snapshots and spot_snapshots "
+        "with no backup and no date filter. Re-run with --confirm-clean if that is intended."
+    )
+
+
 def run_clean_db(pipeline_url: str, auth_token: str) -> None:
     """
     Cleans incomplete/stale intraday snapshot data and logs from Turso Cloud SQLite.
     Preserves thor_rates and other non-intraday reference tables.
     """
     logger.info("[CLEAN] Purging stale/incomplete intraday data from Turso Cloud SQLite...")
+    pre_counts = query_turso_pipeline(pipeline_url, auth_token, [
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM options_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM futures_snapshots;"}},
+        {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) as cnt FROM spot_snapshots;"}},
+        {"type": "close"},
+    ])
+    try:
+        pre = [
+            int(parse_turso_result_rows(pre_counts[i]["response"]["result"])[0]["cnt"] or 0)
+            for i in range(3)
+        ]
+        logger.warning(
+            f"[CLEAN] About to delete ALL rows: options_snapshots={pre[0]:,}, "
+            f"futures_snapshots={pre[1]:,}, spot_snapshots={pre[2]:,}"
+        )
+    except Exception as pre_err:
+        logger.warning(f"[CLEAN] Could not pre-count rows before delete: {pre_err}")
+
     clean_stmts = [
         {"type": "execute", "stmt": {"sql": "DELETE FROM options_snapshots;"}},
         {"type": "execute", "stmt": {"sql": "DELETE FROM futures_snapshots;"}},
@@ -2347,9 +2479,18 @@ def run_clean_db(pipeline_url: str, auth_token: str) -> None:
         {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots;"}},
     ]
     results = query_turso_pipeline(pipeline_url, auth_token, clean_stmts)
-    opt_cnt = results[5].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
-    fut_cnt = results[6].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
-    spot_cnt = results[7].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
+
+    def _post_count(idx: int) -> Any:
+        """Row count after the delete, or "unknown" when the response is short."""
+        if idx >= len(results):
+            return "unknown"
+        try:
+            rows = results[idx]["response"]["result"]["rows"]
+            return int(rows[0][0]["value"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return "unknown"
+
+    opt_cnt, fut_cnt, spot_cnt = _post_count(5), _post_count(6), _post_count(7)
     logger.info(f"[CLEAN] Database tables cleared. Post-clean row counts: Options={opt_cnt}, Futures={fut_cnt}, Spot={spot_cnt}")
     print(f"✅ Clean complete: options_snapshots ({opt_cnt}), futures_snapshots ({fut_cnt}), spot_snapshots ({spot_cnt}). Ready for fresh start.")
     sys.exit(0)
@@ -2383,6 +2524,11 @@ def main() -> None:
         help="Manually trigger and send the latest intraday status report to Telegram."
     )
     parser.add_argument(
+        "--confirm-clean",
+        action="store_true",
+        help="Required together with --clean: acknowledges that --clean deletes every intraday row."
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Bypass trading hours and holiday guards."
@@ -2400,6 +2546,11 @@ def main() -> None:
         help="Maximum requests per second to avoid 429 gateway burst (default: 45.0)."
     )
     args = parser.parse_args()
+
+    refusal = clean_mode_guard(args.clean, args.confirm_clean)
+    if refusal:
+        logger.error(f"[CLEAN GUARD] {refusal}")
+        sys.exit(2)
 
     load_dotenv_simple(".env")
 

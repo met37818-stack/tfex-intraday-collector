@@ -25,7 +25,13 @@ from collector import (
     SESSION_CONFIG,
     BANGKOK_TZ,
     get_penultimate_business_day,
-    get_contract_last_trading_day
+    get_contract_last_trading_day,
+    clean_mode_guard,
+    _http_session,
+    is_tick_within_session,
+    to_turso_arg,
+    generate_all_active_strikes,
+    STRIKE_STEP,
 )
 
 
@@ -218,12 +224,15 @@ class TestCDCCollector(unittest.TestCase):
         self.assertEqual(len(mgr.bid_offer_cache), 0)
 
     @patch("collector.save_cdc_batch_to_turso")
-    def test_open_interest_is_none_in_baseline(self, mock_save):
+    def test_open_interest_passes_through_baseline(self, mock_save):
+        # The session loop refreshes the front future's OI from a REST quote, and
+        # every writer used to hardcode None, so the column was always NULL.
         mgr = SettradeClientManager("app_id", "secret", "broker", "code", False)
         mgr.latest_market_state["S50Z26"] = {
             "symbol": "S50Z26",
             "bid": 920.0, "ask": 920.5, "bid_vol": 10.0, "ask_vol": 20.0,
-            "last": 920.2, "volume": 100.0, "captured_at_bkk": "2026-11-19 09:45:00"
+            "last": 920.2, "volume": 100.0, "open_interest": 123456.0,
+            "captured_at_bkk": "2026-11-19 09:45:00"
         }
         mgr.latest_market_state["S50Z26C900"] = {
             "symbol": "S50Z26C900",
@@ -233,8 +242,8 @@ class TestCDCCollector(unittest.TestCase):
         mgr.capture_baseline_snapshot("https://dummy", "token", "09:45_MORNING_OPEN")
         self.assertTrue(mock_save.called)
         _, _, fut_rows, opt_rows = mock_save.call_args[0][:4]
-        self.assertIsNone(fut_rows[0]["open_interest"])
-        self.assertIsNone(opt_rows[0]["open_interest"])
+        self.assertEqual(fut_rows[0]["open_interest"], 123456.0, "known OI must be persisted")
+        self.assertIsNone(opt_rows[0]["open_interest"], "no OI in the stream stays NULL")
 
     def test_health_check_complete_and_partial(self):
         now_bkk = datetime.now(BANGKOK_TZ)
@@ -427,5 +436,180 @@ class TestCDCCollector(unittest.TestCase):
         self.assertEqual(ltd.strftime("%Y-%m-%d %H:%M:%S"), "2026-12-29 16:30:00")
 
 
+class TestCleanModeGuard(unittest.TestCase):
+    """--clean wipes three tables with no WHERE clause; it needs a second key."""
+
+    def test_clean_requires_explicit_confirmation(self):
+        self.assertIsNone(clean_mode_guard(False, False), "non-clean runs are never blocked")
+        self.assertIsNone(clean_mode_guard(False, True))
+        refusal = clean_mode_guard(True, False)
+        self.assertIsNotNone(refusal)
+        self.assertIn("--confirm-clean", refusal)
+        self.assertIn("EVERY row", refusal)
+        self.assertIsNone(clean_mode_guard(True, True))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHttpSessionPerThread(unittest.TestCase):
+    """Option quotes are fetched from N worker threads; Session is not thread-safe."""
+
+    def test_session_is_per_thread(self):
+        import threading
+
+        main_session = _http_session()
+        self.assertIs(main_session, _http_session(), "same thread must reuse its session")
+
+        seen = {}
+
+        def grab():
+            seen["worker"] = _http_session()
+
+        thread = threading.Thread(target=grab)
+        thread.start()
+        thread.join()
+
+        self.assertIsNot(main_session, seen["worker"], "worker thread must get its own session")
+
+
+class TestSessionTickGuard(unittest.TestCase):
+    """Ticks outside the two continuous sessions must not be recorded."""
+
+    def test_pre_open_ticks_are_rejected(self):
+        from datetime import time as t
+
+        self.assertFalse(is_tick_within_session(t(8, 59)))
+        self.assertFalse(is_tick_within_session(t(9, 0)))
+        self.assertFalse(is_tick_within_session(t(9, 44, 59)))
+        self.assertTrue(is_tick_within_session(t(9, 45)))
+
+    def test_session_boundaries(self):
+        from datetime import time as t
+
+        self.assertTrue(is_tick_within_session(t(12, 30, 5)))
+        self.assertFalse(is_tick_within_session(t(12, 30, 6)))
+        self.assertFalse(is_tick_within_session(t(13, 44, 59)))
+        self.assertTrue(is_tick_within_session(t(13, 45)))
+        self.assertTrue(is_tick_within_session(t(16, 55, 5)))
+        self.assertFalse(is_tick_within_session(t(16, 55, 6)))
+
+
+class TestSqlParameterisation(unittest.TestCase):
+    """Dates must be bound, never interpolated into the SQL text."""
+
+    DATE = "2026-11-20"
+
+    @patch("collector.query_turso_pipeline")
+    def test_stat_queries_bind_every_date(self, mock_query):
+        from collector import query_turso_intraday_stats
+
+        mock_query.return_value = []
+        query_turso_intraday_stats("https://dummy/v2/pipeline", "tok", self.DATE)
+
+        stmts = [r["stmt"] for r in mock_query.call_args[0][2] if r["type"] == "execute"]
+        self.assertTrue(stmts)
+        for stmt in stmts:
+            self.assertNotIn(self.DATE, stmt["sql"], f"date interpolated into SQL: {stmt['sql'][:60]}")
+            if stmt["sql"].startswith("PRAGMA"):
+                continue
+            self.assertIn("?", stmt["sql"])
+            self.assertTrue(stmt.get("args"), f"no bound args for: {stmt['sql'][:60]}")
+
+    @patch("collector.query_turso_pipeline")
+    def test_intraday_data_check_binds_date(self, mock_query):
+        from collector import has_intraday_data_for_date
+
+        mock_query.return_value = []
+        has_intraday_data_for_date("https://dummy/v2/pipeline", "tok", self.DATE)
+
+        stmt = mock_query.call_args[0][2][0]["stmt"]
+        self.assertNotIn(self.DATE, stmt["sql"])
+        self.assertEqual(stmt["args"][0], {"type": "text", "value": f"{self.DATE}%"})
+
+    @patch("collector.query_turso_pipeline")
+    def test_worker_active_check_binds_date(self, mock_query):
+        from collector import is_worker_already_active
+
+        mock_query.return_value = []
+        is_worker_already_active("https://dummy/v2/pipeline", "tok", datetime(2026, 11, 20, 10, 0, tzinfo=BANGKOK_TZ))
+
+        stmt = mock_query.call_args[0][2][0]["stmt"]
+        self.assertNotIn(self.DATE, stmt["sql"])
+        self.assertEqual(stmt["args"][0], {"type": "text", "value": f"{self.DATE}%"})
+
+
+class TestTelegramTokenHygiene(unittest.TestCase):
+    """The bot token lives in the request URL; it must never reach a log line."""
+
+    def test_transport_error_does_not_log_the_token(self):
+        import requests
+        from collector import send_telegram_message
+
+        token = "123456789:AAFakeIntradayTokenMustNotLeak"
+        boom = requests.ConnectionError(
+            f"HTTPSConnectionPool(host='api.telegram.org'): Max retries exceeded with url: /bot{token}/sendMessage"
+        )
+
+        class FakeSession:
+            def post(self, *a, **kw):
+                raise boom
+
+        with patch("collector._http_session", return_value=FakeSession()):
+            with self.assertLogs("tfex_collector", level="ERROR") as logs:
+                ok = send_telegram_message(token, "1", "hello")
+
+        self.assertFalse(ok)
+        joined = " ".join(logs.output)
+        self.assertNotIn(token, joined, "bot token leaked into logs")
+        self.assertIn("ConnectionError", joined)
+
+
+class TestMarketInactiveExitCode(unittest.TestCase):
+    """An inactive market must not exit 0 (cron would call it a success)."""
+
+    def test_no_candles_today_exits_nonzero(self):
+        from datetime import date, timedelta
+        from collector import check_holiday_early_exit
+
+        yesterday = datetime.now(BANGKOK_TZ).date() - timedelta(days=1)
+        stale_epoch = int(datetime(yesterday.year, yesterday.month, yesterday.day, 15, 0, tzinfo=BANGKOK_TZ).timestamp())
+
+        class FakeMarketData:
+            def get_candlestick(self, symbol, interval="1m", limit=1):
+                return {"time": [stale_epoch], "close": [900.0]}
+
+        with self.assertRaises(SystemExit) as ctx:
+            check_holiday_early_exit(FakeMarketData(), "Z26", datetime.now(BANGKOK_TZ))
+        self.assertEqual(ctx.exception.code, 3)
+
+
+class TestTursoArgEncoding(unittest.TestCase):
+    """NaN/Inf are not valid JSON; they must degrade to NULL, not break a batch."""
+
+    def test_nan_and_inf_become_null(self):
+        self.assertEqual(to_turso_arg(float("nan")), {"type": "null"})
+        self.assertEqual(to_turso_arg(float("inf")), {"type": "null"})
+        self.assertEqual(to_turso_arg(float("-inf")), {"type": "null"})
+
+    def test_normal_values_keep_their_type(self):
+        self.assertEqual(to_turso_arg(1.5), {"type": "float", "value": 1.5})
+        self.assertEqual(to_turso_arg(3), {"type": "integer", "value": "3"})
+        self.assertEqual(to_turso_arg(True), {"type": "integer", "value": "1"})
+        self.assertEqual(to_turso_arg(None), {"type": "null"})
+
+
+class TestStrikeGrid(unittest.TestCase):
+    def test_grid_is_step_aligned_and_widened_around_atm(self):
+        grid = generate_all_active_strikes(920.0)
+        self.assertIn(750, grid)
+        self.assertIn(1350, grid)
+        self.assertTrue(all(k % STRIKE_STEP == 0 for k in grid), "every strike must sit on the step")
+        self.assertEqual(min(grid), 670, "ATM 920 - 250 must widen the low end")
+        self.assertEqual(max(grid), 1350, "the fixed 1350 ceiling still wins")
+
+    def test_no_atm_falls_back_to_the_fixed_window(self):
+        grid = generate_all_active_strikes(None)
+        self.assertEqual(min(grid), 750)
+        self.assertEqual(max(grid), 1350)

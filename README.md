@@ -190,13 +190,16 @@
 
 ## ⚡ การทำงานบน GitHub Actions
 
-- **ตารางรันอัตโนมัติ (Schedule):**
+- **ตารางรันอัตโนมัติ (External Scheduler → GitHub Actions):**
+  > workflow นี้ **ไม่มี native `schedule:`** — ใช้ **cron-job.org** เป็นตัวトリガーภายนอก (เรียก `workflow_dispatch` ผ่าน API) ถ้าจะแก้เวลา/เพิ่มรอบ ต้องแก้ที่ cron-job.org ด้วย ไม่ใช่แค่ในไฟล์ workflow
   - ปลุกรันวันละ 2 รอบล่วงหน้าก่อนตลาดเปิด 30 นาที (วันจันทร์–ศุกร์) เพื่อขจัดข้อจำกัด Cron 5 นาทีของ GitHub และรองรับคิวดีเลย์:
     - **รอบเช้า:** `15 2 * * 1-5` UTC (**09:15 น.** เวลาไทย) รันต่อเนื่องจนถึง **12:35 น.**
     - **รอบบ่าย:** `45 6 * * 1-5` UTC (**13:45 น.** เวลาไทย) รันต่อเนื่องจนถึง **17:05 น.**
   - ภายใน Job กำหนด `timeout-minutes: 240` (จำกัดสูงสุด 4 ชม. ต่อรอบ)
   - สั่งรัน `python collector.py --session`
+  - **Exit codes ที่ cron ควรแจ้งเตือน:** `1` = config/auth ผิด, `2` = `--clean` ไม่มี `--confirm-clean`, `3` = ตลาดไม่เคลื่อนไหว 10 นาทีหลังเปิด (วันหยุดนอกปฏิทิน หรือ data outage)
 - **สั่งรันด้วยมือ (Manual Dispatch):**
   - ไปที่แท็บ **Actions** บน GitHub -> เลือก **Collect TFEX 1-Minute Data** -> กด **Run workflow**
-  - เลือกโหมด `mode`: `session`, `once`, หรือ `notify`
+  - เลือกโหมด `mode`: `session`, `once`, `notify`
   - ติ๊ก `force`: ข้ามด่านตรวจเวลาและวันหยุดเพื่อทดสอบทันทีได้ตามต้องการ
+  - ⚠️ **`clean`** (ถ้ายังมีอยู่ใน dropdown ของ workflow) ลบข้อมูล **ทั้งหมด** ในตาราง `options_snapshots`, `futures_snapshots`, `spot_snapshots` โดยไม่มีเงื่อนไขวันที่และไม่มี backup — รันจาก CLI ต้องใส่ `--confirm-clean` ด้วยเสมอ และควรถอด `clean` ออกจาก dropdown เพื่อกันการกดพลาด
