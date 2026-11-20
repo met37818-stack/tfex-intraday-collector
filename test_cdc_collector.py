@@ -619,3 +619,72 @@ class TestStrikeGrid(unittest.TestCase):
         grid = generate_all_active_strikes(None)
         self.assertEqual(min(grid), 750)
         self.assertEqual(max(grid), 1350)
+
+class TestTursoBatchTransport(unittest.TestCase):
+    """
+    The CDC batch writer now goes through tfex_common.turso.execute_pipeline().
+    These pin the contract the collector relies on: success is silent-but-logged,
+    a statement error raises, and the bearer token never reaches the message.
+    """
+
+    REQS = {"requests": [{"type": "execute", "stmt": {"sql": "INSERT INTO t VALUES (1)"}},
+                         {"type": "close"}]}
+    URL = "https://db.turso.io/v2/pipeline"
+    TOKEN = "tok_live_abcdef123456"
+
+    def _post_returning(self, status=200, body=None, text=""):
+        class R:
+            status_code = status
+            def __init__(self):
+                self.text = text
+                self._body = body or {}
+            def json(self):
+                return self._body
+        return R()
+
+    def test_success_logs_and_returns_none(self):
+        import tfex_common.turso as turso
+        from collector import execute_turso_pipeline
+
+        ok = self._post_returning(body={"results": [{"type": "ok", "response": {"result": {"cols": [], "rows": []}}}]})
+        with patch.object(turso.requests, "post", return_value=ok):
+            with self.assertLogs("tfex_collector", level="INFO") as logs:
+                result = execute_turso_pipeline(self.URL, self.TOKEN, self.REQS)
+        self.assertIsNone(result)
+        self.assertIn("committed successfully", " ".join(logs.output))
+
+    def test_statement_error_raises(self):
+        import tfex_common.turso as turso
+        from collector import execute_turso_pipeline
+
+        bad = self._post_returning(body={"results": [{"type": "error",
+                                                     "error": {"message": "UNIQUE constraint failed"}}]})
+        with patch.object(turso.requests, "post", return_value=bad):
+            with self.assertLogs("tfex_collector", level="ERROR"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    execute_turso_pipeline(self.URL, self.TOKEN, self.REQS)
+        self.assertIn("UNIQUE constraint failed", str(ctx.exception))
+
+    def test_token_never_appears_in_error_message(self):
+        import tfex_common.turso as turso
+        from collector import execute_turso_pipeline
+
+        leaky = self._post_returning(status=400, text=f"Authorization: Bearer {self.TOKEN} rejected")
+        with patch.object(turso.requests, "post", return_value=leaky):
+            with self.assertLogs("tfex_collector", level="ERROR") as logs:
+                with self.assertRaises(RuntimeError) as ctx:
+                    execute_turso_pipeline(self.URL, self.TOKEN, self.REQS)
+        self.assertNotIn(self.TOKEN, str(ctx.exception))
+        self.assertNotIn(self.TOKEN, " ".join(logs.output))
+        self.assertIn("***", str(ctx.exception))
+
+    def test_query_adapter_returns_raw_results(self):
+        import tfex_common.turso as turso
+        from collector import query_turso_pipeline
+
+        body = {"results": [{"type": "ok", "response": {"result": {"cols": [{"name": "n"}],
+                                                                 "rows": [[{"type": "integer", "value": "3"}]]}}}]}
+        with patch.object(turso.requests, "post", return_value=self._post_returning(body=body)):
+            results = query_turso_pipeline(self.URL, self.TOKEN, self.REQS["requests"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["type"], "ok")
