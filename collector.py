@@ -425,6 +425,62 @@ def to_turso_arg(val: Any) -> Dict[str, Any]:
     return {"type": "text", "value": str(val)}
 
 
+# ==============================================================================
+# Turso schema (created idempotently on every batch write)
+# ==============================================================================
+ddl_spot = """
+CREATE TABLE IF NOT EXISTS spot_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    last REAL,
+    volume REAL,
+    value REAL
+);
+"""
+ddl_futures = """
+CREATE TABLE IF NOT EXISTS futures_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    bid_vol REAL,
+    ask_vol REAL,
+    last REAL,
+    volume REAL,
+    open_interest REAL
+);
+"""
+ddl_options = """
+CREATE TABLE IF NOT EXISTS options_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at_bkk TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    series TEXT NOT NULL,
+    strike REAL NOT NULL,
+    option_type TEXT NOT NULL,
+    bid REAL,
+    ask REAL,
+    bid_vol REAL,
+    ask_vol REAL,
+    last REAL,
+    volume REAL,
+    open_interest REAL
+);
+"""
+ddl_telegram_log = """
+CREATE TABLE IF NOT EXISTS intraday_telegram_log (
+    trade_date TEXT NOT NULL,
+    checkpoint TEXT NOT NULL,
+    notified_at_bkk TEXT NOT NULL,
+    PRIMARY KEY (trade_date, checkpoint)
+);
+"""
+
+DDL_STATEMENTS: List[str] = [ddl_spot, ddl_futures, ddl_options, ddl_telegram_log]
+
+
 def build_turso_pipeline_payload(
     spot_rows: List[Dict[str, Any]],
     futures_rows: List[Dict[str, Any]],
@@ -432,56 +488,7 @@ def build_turso_pipeline_payload(
 ) -> Dict[str, Any]:
     requests_list: List[Dict[str, Any]] = []
 
-    ddl_spot = """
-    CREATE TABLE IF NOT EXISTS spot_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        last REAL,
-        volume REAL,
-        value REAL
-    );
-    """
-    ddl_futures = """
-    CREATE TABLE IF NOT EXISTS futures_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        bid REAL,
-        ask REAL,
-        bid_vol REAL,
-        ask_vol REAL,
-        last REAL,
-        volume REAL,
-        open_interest REAL
-    );
-    """
-    ddl_options = """
-    CREATE TABLE IF NOT EXISTS options_snapshots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        captured_at_bkk TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        series TEXT NOT NULL,
-        strike REAL NOT NULL,
-        option_type TEXT NOT NULL,
-        bid REAL,
-        ask REAL,
-        bid_vol REAL,
-        ask_vol REAL,
-        last REAL,
-        volume REAL,
-        open_interest REAL
-    );
-    """
-    ddl_telegram_log = """
-    CREATE TABLE IF NOT EXISTS intraday_telegram_log (
-        trade_date TEXT NOT NULL,
-        checkpoint TEXT NOT NULL,
-        notified_at_bkk TEXT NOT NULL,
-        PRIMARY KEY (trade_date, checkpoint)
-    );
-    """
-    for ddl in [ddl_spot, ddl_futures, ddl_options, ddl_telegram_log]:
+    for ddl in DDL_STATEMENTS:
         requests_list.append({
             "type": "execute",
             "stmt": {"sql": ddl.strip()}
