@@ -20,7 +20,7 @@ import calendar
 import logging
 import threading
 from datetime import datetime, time, date, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytz
@@ -49,6 +49,15 @@ logging.getLogger("settrade_v2").setLevel(logging.CRITICAL + 1)
 # Timezone constant
 BANGKOK_TZ = pytz.timezone("Asia/Bangkok")
 
+# Strike grid used to address the SET50 option board. Deliberately wide: the
+# worker subscribes to everything and lets unlisted strikes answer "not found",
+# so a stale grid only costs a few wasted subscriptions.
+STRIKE_STEP = 10
+STRIKE_MIN = 750
+STRIKE_MAX = 1350
+STRIKE_ATM_RANGE = 250
+DEFAULT_ATM_BASE = 920.0
+
 # TFEX Month code mapping
 MONTH_CODES = {
     1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
@@ -58,6 +67,8 @@ QUARTERLY_MONTHS = {3, 6, 9, 12}  # H, M, U, Z
 
 # ==============================================================================
 # SET / TFEX Official Exchange Holidays (2026 - 2027)
+# NOTE: keep in sync with tfex-eod-collector/calendar_utils.py. The two repos must
+# agree on this set, or one collects on a day the other skips.
 # ==============================================================================
 SET_HOLIDAYS = {
     # 2026
@@ -137,7 +148,10 @@ def _market_data_ratelimit_init(self, *args, **kwargs):
     self.remaining_per_second = 60
     self.rate_per_minute = 3600
     self.remaining_per_minute = 3600
-RateLimit.__init__ = _market_data_ratelimit_init
+try:
+    RateLimit.__init__ = _market_data_ratelimit_init
+except Exception as patch_err:  # pragma: no cover - depends on SDK internals
+    logger.warning(f"[SETTRADE] Could not patch RateLimit defaults: {patch_err}")
 
 # 2. Patch settrade_v2 with a persistent requests.Session per thread for
 #    HTTP Keep-Alive connection reuse.
@@ -300,16 +314,16 @@ def generate_all_active_strikes(atm_base: Optional[float] = None) -> List[int]:
     Generates all active strike prices covering the entire TFEX trading board.
     Uses 10-point increments, covering 750 to 1350 and ATM ± 250 points.
     """
-    min_strike = 750
-    max_strike = 1350
+    min_strike = STRIKE_MIN
+    max_strike = STRIKE_MAX
     if atm_base and atm_base > 0:
-        atm_strike = round(atm_base / 10.0) * 10.0
-        min_strike = min(min_strike, int(atm_strike - 250))
-        max_strike = max(max_strike, int(atm_strike + 250))
+        atm_strike = round(atm_base / float(STRIKE_STEP)) * STRIKE_STEP
+        min_strike = min(min_strike, int(atm_strike - STRIKE_ATM_RANGE))
+        max_strike = max(max_strike, int(atm_strike + STRIKE_ATM_RANGE))
 
-    min_strike = int(min_strike // 10 * 10)
-    max_strike = int(max_strike // 10 * 10)
-    return list(range(min_strike, max_strike + 10, 10))
+    min_strike = int(min_strike // STRIKE_STEP * STRIKE_STEP)
+    max_strike = int(max_strike // STRIKE_STEP * STRIKE_STEP)
+    return list(range(min_strike, max_strike + STRIKE_STEP, STRIKE_STEP))
 
 
 def generate_all_stream_symbols(
@@ -405,6 +419,8 @@ def to_turso_arg(val: Any) -> Dict[str, Any]:
     if isinstance(val, int):
         return {"type": "integer", "value": str(val)}
     if isinstance(val, float):
+        if val != val or val in (float("inf"), float("-inf")):  # NaN / Inf
+            return {"type": "null"}
         return {"type": "float", "value": val}
     return {"type": "text", "value": str(val)}
 
@@ -1327,6 +1343,10 @@ class SettradeClientManager:
         self.subscribed_topics: Set[str] = set()
         self._cache_lock = threading.Lock()
         self.last_auth_time: float = 0.0
+        # Symbol whose ticks are echoed to the log (the front future). Set by the
+        # session worker once the active series is resolved, instead of hardcoding
+        # a season code that goes stale at every rollover.
+        self.debug_log_symbol: Optional[str] = None
 
         # Change Data Capture (CDC) State & Coalescing Buffer
         self.latest_market_state: Dict[str, Dict[str, Any]] = {}
@@ -1358,7 +1378,11 @@ class SettradeClientManager:
         with self._cache_lock:
             for conn in self.realtime_connections:
                 try:
-                    conn._stop()
+                    # The SDK only exposes the private _stop(); prefer a public
+                    # name if a future version adds one.
+                    stopper = getattr(conn, "stop", None) or getattr(conn, "_stop", None)
+                    if callable(stopper):
+                        stopper()
                 except Exception:
                     pass
             self.realtime_connections.clear()
@@ -1452,7 +1476,7 @@ class SettradeClientManager:
             else:
                 self.cdc_stats["deduped"] += 1
 
-        if sym.startswith("S50Z26") and not sym.startswith("S50Z26C") and not sym.startswith("S50Z26P"):
+        if self.debug_log_symbol and sym == self.debug_log_symbol:
             logger.info(f"[REALTIME STREAM] {sym}: Bid={bid1} (Vol={bid_vol1}), Ask={ask1} (Vol={ask_vol1})")
 
     def subscribe_symbols(self, symbols: List[str], max_per_conn: int = 35) -> None:
@@ -1792,7 +1816,7 @@ def collect_and_save_snapshot(
             logger.warning(f"Error querying futures symbol {symbol}: {e}")
 
     # 3. Fetch SET50 Options for All Active Strikes (Front & Next Series)
-    atm_base = spot_price_ref or front_futures_price or 900.0
+    atm_base = spot_price_ref or front_futures_price or DEFAULT_ATM_BASE
     all_strikes = generate_all_active_strikes(atm_base)
 
     # Subscribe ALL candidate symbols across the entire board to Realtime Streaming Pool
@@ -2008,6 +2032,7 @@ def run_session_worker(
         )
         sys.exit(0)
 
+    forced_session_deadline: Optional[datetime] = None
     if session_cfg:
         session_name = session_cfg["name"]
         market_open_time = session_cfg["market_open"]
@@ -2019,7 +2044,12 @@ def run_session_worker(
         market_open_time = now_bkk.time()
         verify_holiday_time = time(23, 59, 59)
         session_end_time = (now_bkk + timedelta(minutes=10)).time()
-        logger.info(f"[SESSION] Running forced ad-hoc session until {session_end_time.strftime('%H:%M:%S')}")
+        # A .time() comparison wraps at midnight; compare datetimes instead.
+        forced_session_deadline = now_bkk + timedelta(minutes=10)
+        logger.info(
+        f"[SESSION] Running forced ad-hoc session until "
+        f"{(forced_session_deadline or now_bkk).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
     logger.info(f"=== Starting TFEX Persistent Session Worker: {session_name} ===")
     logger.info(f"Market Open: {market_open_time.strftime('%H:%M:%S')} | Session End: {session_end_time.strftime('%H:%M:%S')}")
@@ -2040,9 +2070,10 @@ def run_session_worker(
     ensure_database_schema(turso_pipeline_url, turso_token)
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
     front_fut_symbol = f"S50{front_opt_series}"
+    settrade_mgr.debug_log_symbol = front_fut_symbol
     logger.info(f"[SESSION] Active Series: Front={front_opt_series} ({front_fut_symbol}), Next={next_opt_series}, Futures={futures_candidates}")
 
-    all_strikes = generate_all_active_strikes(920.0)
+    all_strikes = generate_all_active_strikes(DEFAULT_ATM_BASE)
     all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
         next_series=next_opt_series,
@@ -2149,7 +2180,13 @@ def run_session_worker(
             elif session_name == "AFTERNOON" and loop_time >= time(16, 55, 5):
                 logger.info("[SESSION] Reached afternoon cutoff time (16:55:05). Stopping capture.")
                 break
-            elif loop_time >= session_end_time:
+            elif forced_session_deadline is not None and loop_now >= forced_session_deadline:
+                logger.info(
+                    f"[SESSION] Reached forced session deadline "
+                    f"({forced_session_deadline.strftime('%Y-%m-%d %H:%M:%S')}). Exiting gracefully."
+                )
+                break
+            elif session_cfg is not None and loop_time >= session_end_time:
                 logger.info(f"[SESSION] Reached session end time ({session_end_time.strftime('%H:%M:%S')}). Exiting gracefully.")
                 break
 
@@ -2310,7 +2347,7 @@ def run_single_snapshot(
     futures_candidates, front_opt_series, next_opt_series = resolve_active_series_candidates(now_bkk)
 
     # Pre-subscribe ALL symbols across the entire board to Realtime Streaming Pool
-    all_strikes = generate_all_active_strikes(920.0)
+    all_strikes = generate_all_active_strikes(DEFAULT_ATM_BASE)
     all_symbols = generate_all_stream_symbols(
         front_series=front_opt_series,
         next_series=next_opt_series,
@@ -2435,9 +2472,18 @@ def run_clean_db(pipeline_url: str, auth_token: str) -> None:
         {"type": "execute", "stmt": {"sql": "SELECT COUNT(*) FROM spot_snapshots;"}},
     ]
     results = query_turso_pipeline(pipeline_url, auth_token, clean_stmts)
-    opt_cnt = results[5].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
-    fut_cnt = results[6].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
-    spot_cnt = results[7].get("response", {}).get("result", {}).get("rows", [[{"value": -1}]])[0][0].get("value", 0)
+
+    def _post_count(idx: int) -> Any:
+        """Row count after the delete, or "unknown" when the response is short."""
+        if idx >= len(results):
+            return "unknown"
+        try:
+            rows = results[idx]["response"]["result"]["rows"]
+            return int(rows[0][0]["value"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return "unknown"
+
+    opt_cnt, fut_cnt, spot_cnt = _post_count(5), _post_count(6), _post_count(7)
     logger.info(f"[CLEAN] Database tables cleared. Post-clean row counts: Options={opt_cnt}, Futures={fut_cnt}, Spot={spot_cnt}")
     print(f"✅ Clean complete: options_snapshots ({opt_cnt}), futures_snapshots ({fut_cnt}), spot_snapshots ({spot_cnt}). Ready for fresh start.")
     sys.exit(0)

@@ -29,6 +29,9 @@ from collector import (
     clean_mode_guard,
     _http_session,
     is_tick_within_session,
+    to_turso_arg,
+    generate_all_active_strikes,
+    STRIKE_STEP,
 )
 
 
@@ -580,3 +583,33 @@ class TestMarketInactiveExitCode(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             check_holiday_early_exit(FakeMarketData(), "Z26", datetime.now(BANGKOK_TZ))
         self.assertEqual(ctx.exception.code, 3)
+
+
+class TestTursoArgEncoding(unittest.TestCase):
+    """NaN/Inf are not valid JSON; they must degrade to NULL, not break a batch."""
+
+    def test_nan_and_inf_become_null(self):
+        self.assertEqual(to_turso_arg(float("nan")), {"type": "null"})
+        self.assertEqual(to_turso_arg(float("inf")), {"type": "null"})
+        self.assertEqual(to_turso_arg(float("-inf")), {"type": "null"})
+
+    def test_normal_values_keep_their_type(self):
+        self.assertEqual(to_turso_arg(1.5), {"type": "float", "value": 1.5})
+        self.assertEqual(to_turso_arg(3), {"type": "integer", "value": "3"})
+        self.assertEqual(to_turso_arg(True), {"type": "integer", "value": "1"})
+        self.assertEqual(to_turso_arg(None), {"type": "null"})
+
+
+class TestStrikeGrid(unittest.TestCase):
+    def test_grid_is_step_aligned_and_widened_around_atm(self):
+        grid = generate_all_active_strikes(920.0)
+        self.assertIn(750, grid)
+        self.assertIn(1350, grid)
+        self.assertTrue(all(k % STRIKE_STEP == 0 for k in grid), "every strike must sit on the step")
+        self.assertEqual(min(grid), 670, "ATM 920 - 250 must widen the low end")
+        self.assertEqual(max(grid), 1350, "the fixed 1350 ceiling still wins")
+
+    def test_no_atm_falls_back_to_the_fixed_window(self):
+        grid = generate_all_active_strikes(None)
+        self.assertEqual(min(grid), 750)
+        self.assertEqual(max(grid), 1350)
