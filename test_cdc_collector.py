@@ -744,3 +744,19 @@ class TestCheckpointMessageHonesty(unittest.TestCase):
                                           max_ts="16:55:00"), checkpoint="EVENING_CLOSE")
         self.assertIn("/ 355 (100.0%)", msg)
         self.assertIn("Integrity Verdict", msg)
+
+    def test_message_stays_compact(self):
+        """Regression guard: the previous layout ran ~1,150 characters with headings."""
+        close = self._msg(stats=self._stats(spot_count=355, morning_bars=165,
+                                            afternoon_bars=190, min_ts="09:45:00",
+                                            max_ts="16:55:00"), checkpoint="EVENING_CLOSE")
+        self.assertLessEqual(len(close), 780)
+        self.assertLessEqual(len(self._msg()), 780)
+
+    def test_span_shows_only_the_clock(self):
+        msg = self._msg(stats=self._stats(spot_count=355, morning_bars=165,
+                                          afternoon_bars=190, min_ts="2026-11-20 09:45:00",
+                                          max_ts="2026-11-20 16:55:00"),
+                        checkpoint="EVENING_CLOSE")
+        self.assertIn("09:45–16:55", msg)
+        self.assertNotIn("2026-11-20 09:45", msg)
