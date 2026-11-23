@@ -66,6 +66,7 @@ from tfex_common.calendar import (  # noqa: E402
 )
 # Telegram dispatch is shared too. BANGKOK_TZ stays local: it is a pytz zone used
 # with .localize() in 20+ places, which the package's fixed-offset tzinfo lacks.
+from tfex_common.report import Report, bullet  # noqa: E402
 from tfex_common.telegram import send_alert  # noqa: E402
 from tfex_common.turso import execute_pipeline  # noqa: E402
 from tfex_common.turso import normalize_url as normalize_turso_pipeline_url  # noqa: E402
@@ -908,6 +909,30 @@ def get_current_checkpoint(t: time) -> Optional[str]:
     return None
 
 
+def _bar_age_minutes(max_ts, now_bkk: datetime) -> Optional[float]:
+    """
+    Age of the newest bar in minutes, or None when there is no timestamp.
+
+    The old message printed "Status: 🟢 Morning Session Active" from the clock alone,
+    so a collector that had stopped receiving ticks still reported a healthy session.
+    """
+    if not max_ts or str(max_ts).strip() in ("-", ""):
+        return None
+    text = str(max_ts).strip()
+    try:
+        if len(text) >= 10 and text[4] == "-":
+            dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=BANGKOK_TZ)
+        else:
+            t = datetime.strptime(text, "%H:%M:%S" if text.count(":") == 2 else "%H:%M")
+            dt = now_bkk.replace(hour=t.hour, minute=t.minute,
+                                 second=getattr(t, "second", 0), microsecond=0)
+    except ValueError:
+        return None
+    return max(0.0, (now_bkk - dt).total_seconds() / 60.0)
+
+
 def build_checkpoint_message(
     checkpoint: str,
     trade_date: str,
@@ -916,9 +941,13 @@ def build_checkpoint_message(
     is_manual: bool = False,
     cdc_stats: Optional[Dict[str, int]] = None
 ) -> str:
-    date_str = now_bkk.strftime("%Y%m%d")
-    time_str = now_bkk.strftime("%H:%M")
+    """
+    Scheduled status report.
 
+    Same contract as the rest of the pipeline: measured numbers first, the verdict
+    labelled as a judgement, and anything this run could not read listed once under
+    "ยังไม่พร้อม" instead of being printed as N/A inside a list of real values.
+    """
     topic_map = {
         "MORNING_OPEN": "Morning Open Status",
         "MIDDAY_CLOSE": "Midday Break Report",
@@ -927,24 +956,17 @@ def build_checkpoint_message(
         "MANUAL_REPORT": "Manual Status Inspection"
     }
     topic_desc = topic_map.get(checkpoint, checkpoint)
-
-    header = (
-        f"Date: {date_str} | Time : {time_str} | Topic : TFEX Collector - {topic_desc}\n"
-        f"Model : Settrade v2 Collector | API No: Turso SQLite Pipeline"
-    )
+    is_close_report = checkpoint in ("MIDDAY_CLOSE", "EVENING_CLOSE")
 
     spot_count = stats.get("spot_count", 0)
     spot_last = stats.get("spot_last")
     spot_vol = stats.get("spot_vol", 0.0)
-
     fut_count = stats.get("fut_count", 0)
     fut_sym = stats.get("fut_symbol", "S50")
     fut_last = stats.get("fut_last")
     fut_oi = stats.get("fut_oi", 0.0)
-
     opt_count = stats.get("opt_count", 0)
     opt_syms = stats.get("opt_syms", 0)
-
     morning_bars = stats.get("morning_bars", 0)
     afternoon_bars = stats.get("afternoon_bars", 0)
     min_ts = stats.get("min_ts", "-")
@@ -952,81 +974,42 @@ def build_checkpoint_message(
     db_size = stats.get("db_size_str", "-")
     db_pages = stats.get("db_pages", 0)
     error_count = stats.get("error_count", 0)
-    err_str = "0 ครั้ง" if error_count == 0 else f"⚠️ {error_count} ครั้ง"
 
-    spot_str = f"{spot_last:.2f}" if spot_last is not None else "N/A"
-    fut_str = f"{fut_last:.2f}" if fut_last is not None else "N/A"
+    subtitle = f"{now_bkk.strftime('%Y%m%d %H:%M')} · trade_date {trade_date}"
+    if is_manual:
+        subtitle += " · manual test trigger"
+    rep = Report(title=f"TFEX INTRADAY · {topic_desc}", subtitle=subtitle)
 
-    mode_tag = " <i>(Manual Test Trigger)</i>" if is_manual else ""
-
-    if checkpoint == "MORNING_OPEN":
-        body = (
-            f"🔔 <b>TFEX INTRADAY: MORNING OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Morning Session Active (09:45 - 12:30)\n"
-            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
-            f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
-            f"• <b>Bars Captured (Today):</b> <b>{spot_count}</b> bars\n"
-            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> (Vol: {spot_vol:,.0f})\n"
-            f"• <b>Front Futures ({fut_sym}):</b> <code>{fut_str}</code> (OI: {fut_oi:,.0f})\n"
-            f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts ({opt_count} snaps)\n"
-            f"• <b>API/DB Errors:</b> {err_str}\n"
-            f"• <b>Storage:</b> Turso SQLite {db_size}"
-        )
-    elif checkpoint == "MIDDAY_CLOSE":
+    # ---- วัดได้
+    rep.add_measured(bullet(f"<b>Bars วันนี้:</b> <b>{spot_count}</b> | <b>Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>"))
+    if is_close_report:
+        close_pct = (spot_count / 355.0) * 100.0 if spot_count else 0.0
+        rep.add_measured(bullet(f"<b>Total Daily Bars:</b> <b>{spot_count}</b> / 355 ({close_pct:.1f}%)"))
+    if checkpoint == "MIDDAY_CLOSE" or is_close_report:
         m_pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
-        health = "🟢 Complete" if m_pct >= 99.0 else f"🟡 Partial ({morning_bars}/165 bars)"
-        body = (
-            f"☕ <b>TFEX INTRADAY: MIDDAY BREAK REPORT</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> ⏸️ Morning Session Closed\n"
-            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
-            f"• <b>Morning Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
-            f"• <b>Morning Bars:</b> <b>{morning_bars}</b> / 165 ({m_pct:.1f}%)\n"
-            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
-            f"• <b>Snapshots:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
-            f"• <b>API/DB Errors:</b> {err_str}\n"
-            f"• <b>Health Check:</b> {health}\n"
-            f"• <b>Storage:</b> Turso SQLite {db_size}"
-        )
-    elif checkpoint == "AFTERNOON_OPEN":
-        warn = "\n⚠️ <b>Alert:</b> No bars captured yet for afternoon session!" if afternoon_bars == 0 else ""
-        body = (
-            f"📈 <b>TFEX INTRADAY: AFTERNOON OPEN STATUS</b>{mode_tag}\n\n"
-            f"• <b>Status:</b> 🟢 Afternoon Session Active (13:45 - 16:55)\n"
-            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
-            f"• <b>Afternoon Bars (since 13:45):</b> <b>{afternoon_bars}</b> bars\n"
-            f"• <b>Latest Timestamp:</b> <code>{max_ts}</code>\n"
-            f"• <b>SET50 Spot:</b> <code>{spot_str}</code> | <b>{fut_sym}:</b> <code>{fut_str}</code>\n"
-            f"• <b>Active Options:</b> <b>{opt_syms}</b> contracts\n"
-            f"• <b>API/DB Errors:</b> {err_str}\n"
-            f"• <b>Storage:</b> Turso SQLite {db_size}{warn}"
-        )
-    else:  # EVENING_CLOSE or MANUAL_REPORT
-        total_expected = 355.0
-        c_pct = (spot_count / total_expected) * 100.0 if spot_count else 0.0
-        if c_pct >= 99.0:
-            verdict = "🟢 Complete (≥99%)"
-        elif c_pct >= 90.0:
-            verdict = f"🟡 Partial ({spot_count}/355 bars)"
-        else:
-            verdict = f"🚨 Incomplete ({spot_count}/355 bars)"
+        rep.add_measured(bullet(f"<b>Morning bars:</b> {morning_bars} / 165 ({m_pct:.1f}%)"))
+    if checkpoint == "AFTERNOON_OPEN" or is_close_report:
+        rep.add_measured(bullet(f"<b>Afternoon bars:</b> {afternoon_bars}"))
 
-        title = "🏁 <b>TFEX INTRADAY: FULL-DAY CLOSE SUMMARY</b>" if checkpoint == "EVENING_CLOSE" else "📊 <b>TFEX INTRADAY: CURRENT STATUS REPORT</b>"
-        body = (
-            f"{title}{mode_tag}\n\n"
-            f"• <b>Status:</b> 🔒 Market Closed\n"
-            f"• <b>Trade Date:</b> <code>{trade_date}</code>\n"
-            f"• <b>Trading Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>\n"
-            f"• <b>Total Daily Bars:</b> <b>{spot_count}</b> / 355 ({c_pct:.1f}%)\n"
-            f"  - Morning (09:45-12:30): {morning_bars} bars\n"
-            f"  - Afternoon (13:45-16:55): {afternoon_bars} bars\n"
-            f"• <b>Settlement Ref:</b> SET50 <code>{spot_str}</code> | {fut_sym} <code>{fut_str}</code>\n"
-            f"• <b>Snapshots Saved:</b> Spot: {spot_count} | Fut: {fut_count} | Opt: {opt_count}\n"
-            f"• <b>API/DB Errors:</b> {err_str}\n"
-            f"• <b>Storage:</b> Turso SQLite {db_size}\n"
-            f"• <b>Integrity Verdict:</b> {verdict}"
-        )
+    if spot_last is not None:
+        rep.add_measured(bullet(f"<b>SET50 Spot:</b> <code>{float(spot_last):.2f}</code> (Vol {float(spot_vol or 0):,.0f})"))
+    else:
+        rep.add_pending("ราคา SET50 Spot")
+    if fut_last is not None:
+        rep.add_measured(bullet(f"<b>{fut_sym}:</b> <code>{float(fut_last):.2f}</code> (OI {float(fut_oi or 0):,.0f})"))
+    else:
+        rep.add_pending(f"ราคา {fut_sym}")
 
-    cdc_sec = ""
+    rep.add_measured(bullet(
+        f"<b>Snapshots:</b> Spot {spot_count} | Fut {fut_count} | Opt {opt_count} "
+        f"(options {opt_syms} contracts)"
+    ))
+    if db_size and str(db_size).strip() != "-":
+        rep.add_measured(bullet(f"<b>Storage:</b> Turso SQLite {db_size} ({db_pages:,} pages)"))
+    else:
+        rep.add_pending("ขนาดฐานข้อมูล")
+    rep.add_measured(bullet(f"<b>API/DB Errors:</b> " + ("<code>0</code>" if error_count == 0 else f"⚠️ <code>{error_count}</code>")))
+
     if cdc_stats:
         rcv = cdc_stats.get("received", 0)
         chg = cdc_stats.get("changed", 0)
@@ -1034,14 +1017,49 @@ def build_checkpoint_message(
         fls = cdc_stats.get("flushes", 0)
         rows_w = cdc_stats.get("rows_written", 0)
         ded_pct = (ded / rcv * 100.0) if rcv > 0 else 0.0
-        cdc_sec = (
-            f"\n\n⚡ <b>CDC Stream Stats:</b>\n"
-            f"• <b>Ticks:</b> <code>{rcv:,}</code> received | <code>{chg:,}</code> changed\n"
-            f"• <b>Noise Filter:</b> <code>{ded:,}</code> filtered ({ded_pct:.1f}% reduction)\n"
-            f"• <b>Turso Flushes:</b> <code>{fls:,}</code> batches ({rows_w:,} rows written)"
-        )
+        rep.add_measured(bullet(f"<b>CDC Stream Stats:</b> <code>{rcv:,}</code> ticks received | <code>{chg:,}</code> changed"))
+        rep.add_measured(bullet(f"Noise Filter: <code>{ded:,}</code> filtered (<b>{ded_pct:.1f}% reduction</b>)"))
+        rep.add_measured(bullet(f"Turso Flushes: <code>{fls:,}</code> batches ({rows_w:,} rows written)"))
+    else:
+        rep.add_pending("CDC Stream Stats (ยังไม่เริ่ม stream)")
 
-    return f"{header}\n\n{body}{cdc_sec}"
+    # ---- อนุมาน: สถานะเซสชัน + คำตัดสินความครบถ้วน
+    age = _bar_age_minutes(max_ts, now_bkk)
+    if is_close_report:
+        rep.add_inferred(bullet("🔒 ตลาดปิดภาคแล้ว — ตัวเลขข้างบนคือภาพสุดท้ายของรอบ"))
+    elif age is None:
+        rep.add_inferred(bullet("⚪ ไม่มีข้อมูลบาร์ให้ประเมินสถานะเซสชัน"))
+    elif age <= 5.0:
+        rep.add_inferred(bullet(f"🟢 มีบาร์ใหม่ภายใน 5 นาที (ล่าสุด {age:.0f} นาทีก่อน) — session ทำงานปกติ"))
+    else:
+        rep.add_inferred(bullet(f"🟡 บาร์ล่าสุดเก่า {age:.0f} นาที — อาจไม่มี tick เข้ามา ควรตรวจดูก่อนเชื่อว่าปกติ"))
+
+    if checkpoint == "MIDDAY_CLOSE":
+        pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
+        verdict = "🟢 Complete" if pct >= 99.0 else f"🟡 Partial ({morning_bars}/165 bars)"
+        rep.add_inferred(bullet(
+            f"<b>Health Check:</b> {verdict} <i>(เกณฑ์ 99% เป็นดุลยพินิจ ไม่ใช่ข้อกำหนดของ TFEX)</i>"
+        ))
+    elif is_close_report:
+        pct = (spot_count / 355.0) * 100.0 if spot_count else 0.0
+        if pct >= 99.0:
+            verdict = "🟢 Complete (≥99%)"
+        elif pct >= 90.0:
+            verdict = f"🟡 Partial ({spot_count}/355 bars)"
+        else:
+            verdict = f"🚨 Incomplete ({spot_count}/355 bars)"
+        rep.add_inferred(bullet(
+            f"<b>Integrity Verdict:</b> {verdict} <i>(เกณฑ์ 99%/90% เป็นดุลยพินิจ ไม่ใช่ข้อกำหนดของ TFEX)</i>"
+        ))
+
+    # ---- เงื่อนไขที่ทำให้ตัวเลขนี้ใช้ไม่ได้
+    if not is_close_report:
+        rep.add_watch("ถ้า bars ไม่ขยับเกิน 5 นาทีในเวลาเทรด ให้ตรวจ CDC websocket และ Settrade session")
+    if error_count:
+        rep.add_watch(f"error {error_count} ครั้งในรอบนี้ — ถ้าซ้ำ 2 รอบติด ให้ตรวจ API key/session")
+    rep.add_watch("ถ้าจำนวน options contracts หลุดจากที่เคยเห็น ให้ตรวจการ resolve front series")
+
+    return rep.build_telegram()
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> bool:
@@ -1076,14 +1094,14 @@ def send_critical_error_alert(
         _last_critical_alert_time = now_time
 
     now_bkk_str = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    msg = (
-        f"🚨 <b>TFEX INTRADAY COLLECTOR: CRITICAL FAILURE ALERT</b>\n\n"
-        f"• <b>Error:</b> ❌ {error_title}\n"
-        f"• <b>Details:</b> <code>{error_detail}</code>\n"
-        f"• <b>Timestamp:</b> <code>{now_bkk_str}</code>\n"
-        f"• <b>Action:</b> กรุณาตรวจสอบสถานะ Turso Database และ Settrade Open API ด่วน"
+    rep = Report(
+        title="TFEX INTRADAY COLLECTOR: CRITICAL FAILURE",
+        subtitle=f"เกิดเมื่อ {now_bkk_str}",
     )
-    return send_telegram_message(telegram_bot_token, telegram_chat_id, msg)
+    rep.add_measured(bullet(f"<b>Error:</b> ❌ {error_title}"))
+    rep.add_measured(bullet(f"<b>Details:</b> <code>{error_detail}</code>"))
+    rep.add_watch("ตรวจ Turso Database และ Settrade Open API · alert ถัดไปถูกจำกัดด้วย cooldown 15 นาที")
+    return send_telegram_message(telegram_bot_token, telegram_chat_id, rep.build_telegram())
 
 
 def check_and_send_checkpoints(
