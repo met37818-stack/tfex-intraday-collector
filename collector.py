@@ -66,6 +66,7 @@ from tfex_common.calendar import (  # noqa: E402
 )
 # Telegram dispatch is shared too. BANGKOK_TZ stays local: it is a pytz zone used
 # with .localize() in 20+ places, which the package's fixed-offset tzinfo lacks.
+from tfex_common.lifecycle import Lifecycle  # noqa: E402
 from tfex_common.report import Report, bullet  # noqa: E402
 from tfex_common.telegram import send_alert  # noqa: E402
 from tfex_common.turso import execute_pipeline  # noqa: E402
@@ -2455,30 +2456,48 @@ def main() -> None:
         is_sandbox=is_sandbox
     )
 
-    # Mode: --once
-    if args.once:
-        run_single_snapshot(
-            settrade_mgr=settrade_mgr,
-            turso_pipeline_url=turso_pipeline_url,
-            turso_token=turso_token,
-            telegram_bot_token=telegram_bot_token,
-            telegram_chat_id=telegram_chat_id,
-            workers=args.workers,
-            max_rps=args.max_rps,
-            force=args.force
-        )
-
-    # Default / Mode: --session
-    run_session_worker(
-        settrade_mgr=settrade_mgr,
-        turso_pipeline_url=turso_pipeline_url,
-        turso_token=turso_token,
-        telegram_bot_token=telegram_bot_token,
-        telegram_chat_id=telegram_chat_id,
-        workers=args.workers,
-        max_rps=args.max_rps,
-        force=args.force
-    )
+    # Lifecycle notices: one message when the run starts, one when it finishes, one
+    # when it fails. Before this, a session that died at 10:12 (or never started)
+    # left nothing in Telegram - the only trace was a red Actions run.
+    life_mode = "once" if args.once else "session"
+    life_detail = {
+        "workers": args.workers,
+        "max_rps": args.max_rps,
+        "force": args.force,
+        "sandbox": is_sandbox,
+    }
+    with Lifecycle(
+        "tfex-intraday-collector",
+        life_mode,
+        life_detail,
+        enabled=bool(telegram_bot_token and telegram_chat_id),
+        bot_token=telegram_bot_token,
+        chat_id=telegram_chat_id,
+    ) as life:
+        if args.once:
+            run_single_snapshot(
+                settrade_mgr=settrade_mgr,
+                turso_pipeline_url=turso_pipeline_url,
+                turso_token=turso_token,
+                telegram_bot_token=telegram_bot_token,
+                telegram_chat_id=telegram_chat_id,
+                workers=args.workers,
+                max_rps=args.max_rps,
+                force=args.force
+            )
+            life.finished({"โหมด": "single snapshot"})
+        else:
+            run_session_worker(
+                settrade_mgr=settrade_mgr,
+                turso_pipeline_url=turso_pipeline_url,
+                turso_token=turso_token,
+                telegram_bot_token=telegram_bot_token,
+                telegram_chat_id=telegram_chat_id,
+                workers=args.workers,
+                max_rps=args.max_rps,
+                force=args.force
+            )
+            life.finished({"โหมด": "session loop ended"})
 
 
 if __name__ == "__main__":
