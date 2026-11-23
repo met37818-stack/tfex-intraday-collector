@@ -688,3 +688,59 @@ class TestTursoBatchTransport(unittest.TestCase):
             results = query_turso_pipeline(self.URL, self.TOKEN, self.REQS["requests"])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["type"], "ok")
+
+class TestCheckpointMessageHonesty(unittest.TestCase):
+    """
+    The old message printed "Status: 🟢 Morning Session Active" from the clock alone,
+    and rendered missing prices as "N/A" inside a list of real numbers.
+    """
+
+    def _stats(self, **kw):
+        base = dict(spot_count=45, spot_last=925.3, spot_vol=1000, fut_count=45,
+                    fut_symbol="S50Z26", fut_last=926.0, fut_oi=500000, opt_count=900,
+                    opt_syms=120, morning_bars=45, afternoon_bars=0, min_ts="09:45:00",
+                    max_ts="10:29:00", db_size_str="12.4 MB", db_pages=3100, error_count=0)
+        base.update(kw)
+        return base
+
+    def _msg(self, stats=None, checkpoint="MORNING_OPEN", now=None, cdc=None):
+        import collector as col
+        bkk = col.BANGKOK_TZ
+        now = now or datetime(2026, 11, 20, 10, 30, 0, tzinfo=bkk)
+        return col.build_checkpoint_message(checkpoint, "2026-11-20", now,
+                                            stats or self._stats(), cdc_stats=cdc)
+
+    def test_fresh_bars_report_a_healthy_session(self):
+        msg = self._msg()
+        self.assertIn("มีบาร์ใหม่ภายใน 5 นาที", msg)
+
+    def test_stale_bars_are_not_reported_as_active(self):
+        msg = self._msg(stats=self._stats(max_ts="09:55:00"))
+        self.assertIn("บาร์ล่าสุดเก่า 35 นาที", msg)
+        self.assertNotIn("session ทำงานปกติ", msg)
+        self.assertNotIn("Session Active", msg)
+
+    def test_missing_price_is_pending_not_na(self):
+        msg = self._msg(stats=self._stats(spot_last=None))
+        self.assertIn("ราคา SET50 Spot", msg)
+        self.assertNotIn(">N/A<", msg)
+
+    def test_missing_storage_is_pending(self):
+        msg = self._msg(stats=self._stats(db_size_str="-"))
+        self.assertIn("ขนาดฐานข้อมูล", msg)
+
+    def test_no_cdc_stats_yet_is_declared(self):
+        msg = self._msg()
+        self.assertIn("CDC Stream Stats (ยังไม่เริ่ม stream)", msg)
+
+    def test_sections_always_render(self):
+        msg = self._msg()
+        for icon in ("📏", "🧠", "⏳", "🔁"):
+            self.assertIn(icon, msg)
+
+    def test_close_report_keeps_the_daily_ratio_line(self):
+        msg = self._msg(stats=self._stats(spot_count=355, morning_bars=165,
+                                          afternoon_bars=190, min_ts="09:45:00",
+                                          max_ts="16:55:00"), checkpoint="EVENING_CLOSE")
+        self.assertIn("/ 355 (100.0%)", msg)
+        self.assertIn("Integrity Verdict", msg)
