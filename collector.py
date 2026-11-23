@@ -934,6 +934,24 @@ def _bar_age_minutes(max_ts, now_bkk: datetime) -> Optional[float]:
     return max(0.0, (now_bkk - dt).total_seconds() / 60.0)
 
 
+def _hhmm(value) -> str:
+    """`2026-11-23 09:45` or `09:45:00` -> `09:45`; unchanged when no clock is found."""
+    match = re.search(r"\d{1,2}:\d{2}", str(value or ""))
+    return match.group(0) if match else str(value or "").strip()
+
+
+def _short_thai_date(iso_date) -> str:
+    """`2026-11-20` -> `20 พ.ย.` — falls back to the raw text when unparseable."""
+    thai_months = ("ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+                   "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.")
+    text = str(iso_date or "").strip()
+    try:
+        dt = datetime.strptime(text[:10], "%Y-%m-%d")
+    except ValueError:
+        return text
+    return f"{dt.day} {thai_months[dt.month - 1]}"
+
+
 def build_checkpoint_message(
     checkpoint: str,
     trade_date: str,
@@ -943,18 +961,19 @@ def build_checkpoint_message(
     cdc_stats: Optional[Dict[str, int]] = None
 ) -> str:
     """
-    Scheduled status report.
+    Scheduled status report — compact layout (style A).
 
-    Same contract as the rest of the pipeline: measured numbers first, the verdict
-    labelled as a judgement, and anything this run could not read listed once under
-    "ยังไม่พร้อม" instead of being printed as N/A inside a list of real values.
+    One line per fact instead of four headings and a divider per fact. The
+    measured / inferred / not-ready split is still explicit (leading 📏 / 🧠 / ⏳),
+    and a number this run could not read goes to "ยังไม่พร้อม" instead of being
+    printed as N/A or 0.
     """
     topic_map = {
-        "MORNING_OPEN": "Morning Open Status",
-        "MIDDAY_CLOSE": "Midday Break Report",
-        "AFTERNOON_OPEN": "Afternoon Open Status",
-        "EVENING_CLOSE": "Full-Day Close Summary",
-        "MANUAL_REPORT": "Manual Status Inspection"
+        "MORNING_OPEN": "เปิดเช้า",
+        "MIDDAY_CLOSE": "พักเที่ยง",
+        "AFTERNOON_OPEN": "เปิดบ่าย",
+        "EVENING_CLOSE": "ปิดตลาด",
+        "MANUAL_REPORT": "ตรวจ manual",
     }
     topic_desc = topic_map.get(checkpoint, checkpoint)
     is_close_report = checkpoint in ("MIDDAY_CLOSE", "EVENING_CLOSE")
@@ -976,40 +995,52 @@ def build_checkpoint_message(
     db_pages = stats.get("db_pages", 0)
     error_count = stats.get("error_count", 0)
 
-    subtitle = f"{now_bkk.strftime('%Y%m%d %H:%M')} · trade_date {trade_date}"
+    subtitle = f"{now_bkk.strftime('%H:%M')} · trade_date {trade_date}"
     if is_manual:
-        subtitle += " · manual test trigger"
-    rep = Report(title=f"TFEX INTRADAY · {topic_desc}", subtitle=subtitle)
+        subtitle += " · manual"
+    rep = Report(
+        title=f"📊 Intraday {_short_thai_date(trade_date)} · {topic_desc}",
+        subtitle=subtitle,
+        icon="",
+        measured_heading=None,
+        plan_heading=None,
+        show_divider=False,
+    )
 
     # ---- วัดได้
-    rep.add_measured(bullet(f"<b>Bars วันนี้:</b> <b>{spot_count}</b> | <b>Span:</b> <code>{min_ts}</code> – <code>{max_ts}</code>"))
+    span = f"{_hhmm(min_ts)}–{_hhmm(max_ts)}"
     if is_close_report:
         close_pct = (spot_count / 355.0) * 100.0 if spot_count else 0.0
-        rep.add_measured(bullet(f"<b>Total Daily Bars:</b> <b>{spot_count}</b> / 355 ({close_pct:.1f}%)"))
+        bars_line = f"📏 Bars <b>{spot_count}</b> / 355 ({close_pct:.1f}%) · {span}"
+    else:
+        bars_line = f"📏 Bars <b>{spot_count}</b> · {span}"
     if checkpoint == "MIDDAY_CLOSE" or is_close_report:
         m_pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
-        rep.add_measured(bullet(f"<b>Morning bars:</b> {morning_bars} / 165 ({m_pct:.1f}%)"))
+        bars_line += f" · เช้า {morning_bars}/165 ({m_pct:.0f}%)"
     if checkpoint == "AFTERNOON_OPEN" or is_close_report:
-        rep.add_measured(bullet(f"<b>Afternoon bars:</b> {afternoon_bars}"))
+        bars_line += f" · บ่าย {afternoon_bars}"
+    rep.add_measured(bars_line)
 
+    price_bits = []
     if spot_last is not None:
-        rep.add_measured(bullet(f"<b>SET50 Spot:</b> <code>{float(spot_last):.2f}</code> (Vol {float(spot_vol or 0):,.0f})"))
+        price_bits.append(f"SET50 <b>{float(spot_last):.2f}</b> (Vol {float(spot_vol or 0):,.0f})")
     else:
         rep.add_pending("ราคา SET50 Spot")
     if fut_last is not None:
-        rep.add_measured(bullet(f"<b>{fut_sym}:</b> <code>{float(fut_last):.2f}</code> (OI {float(fut_oi or 0):,.0f})"))
+        price_bits.append(f"{fut_sym} <b>{float(fut_last):.2f}</b> (OI {float(fut_oi or 0):,.0f})")
     else:
         rep.add_pending(f"ราคา {fut_sym}")
+    if price_bits:
+        rep.add_measured("📏 " + " · ".join(price_bits))
 
-    rep.add_measured(bullet(
-        f"<b>Snapshots:</b> Spot {spot_count} | Fut {fut_count} | Opt {opt_count} "
-        f"(options {opt_syms} contracts)"
-    ))
+    db_bits = f"Snapshot Spot/Fut/Opt {spot_count}/{fut_count}/{opt_count} ({opt_syms} opt contracts)"
     if db_size and str(db_size).strip() != "-":
-        rep.add_measured(bullet(f"<b>Storage:</b> Turso SQLite {db_size} ({db_pages:,} pages)"))
+        db_bits += f" · DB {db_size}"
     else:
         rep.add_pending("ขนาดฐานข้อมูล")
-    rep.add_measured(bullet(f"<b>API/DB Errors:</b> " + ("<code>0</code>" if error_count == 0 else f"⚠️ <code>{error_count}</code>")))
+    if error_count:
+        db_bits += f" · ⚠️ error {error_count}"
+    rep.add_measured("📏 " + db_bits)
 
     if cdc_stats:
         rcv = cdc_stats.get("received", 0)
@@ -1018,9 +1049,11 @@ def build_checkpoint_message(
         fls = cdc_stats.get("flushes", 0)
         rows_w = cdc_stats.get("rows_written", 0)
         ded_pct = (ded / rcv * 100.0) if rcv > 0 else 0.0
-        rep.add_measured(bullet(f"<b>CDC Stream Stats:</b> <code>{rcv:,}</code> ticks received | <code>{chg:,}</code> changed"))
-        rep.add_measured(bullet(f"Noise Filter: <code>{ded:,}</code> filtered (<b>{ded_pct:.1f}% reduction</b>)"))
-        rep.add_measured(bullet(f"Turso Flushes: <code>{fls:,}</code> batches ({rows_w:,} rows written)"))
+        rep.add_measured(
+            f"📏 CDC Stream Stats: <code>{rcv:,}</code> ticks → <code>{chg:,}</code> changed · "
+            f"filter <code>{ded:,}</code> ({ded_pct:.1f}% reduction) · "
+            f"{fls:,} flush / {rows_w:,} rows"
+        )
     else:
         rep.add_pending("CDC Stream Stats (ยังไม่เริ่ม stream)")
 
@@ -1038,9 +1071,7 @@ def build_checkpoint_message(
     if checkpoint == "MIDDAY_CLOSE":
         pct = (morning_bars / 165.0) * 100.0 if morning_bars else 0.0
         verdict = "🟢 Complete" if pct >= 99.0 else f"🟡 Partial ({morning_bars}/165 bars)"
-        rep.add_inferred(bullet(
-            f"<b>Health Check:</b> {verdict} <i>(เกณฑ์ 99% เป็นดุลยพินิจ ไม่ใช่ข้อกำหนดของ TFEX)</i>"
-        ))
+        rep.add_inferred(bullet(f"<b>Health Check:</b> {verdict} <i>(เกณฑ์ 99% เป็นดุลยพินิจ)</i>"))
     elif is_close_report:
         pct = (spot_count / 355.0) * 100.0 if spot_count else 0.0
         if pct >= 99.0:
@@ -1049,16 +1080,16 @@ def build_checkpoint_message(
             verdict = f"🟡 Partial ({spot_count}/355 bars)"
         else:
             verdict = f"🚨 Incomplete ({spot_count}/355 bars)"
-        rep.add_inferred(bullet(
-            f"<b>Integrity Verdict:</b> {verdict} <i>(เกณฑ์ 99%/90% เป็นดุลยพินิจ ไม่ใช่ข้อกำหนดของ TFEX)</i>"
-        ))
+        rep.add_inferred(bullet(f"<b>Integrity Verdict:</b> {verdict} <i>(เกณฑ์ 99%/90% เป็นดุลยพินิจ)</i>"))
 
     # ---- เงื่อนไขที่ทำให้ตัวเลขนี้ใช้ไม่ได้
+    watch_bits = []
     if not is_close_report:
-        rep.add_watch("ถ้า bars ไม่ขยับเกิน 5 นาทีในเวลาเทรด ให้ตรวจ CDC websocket และ Settrade session")
+        watch_bits.append("bars ไม่ขยับเกิน 5 นาทีในเวลาเทรด → ตรวจ CDC websocket / Settrade session")
     if error_count:
-        rep.add_watch(f"error {error_count} ครั้งในรอบนี้ — ถ้าซ้ำ 2 รอบติด ให้ตรวจ API key/session")
-    rep.add_watch("ถ้าจำนวน options contracts หลุดจากที่เคยเห็น ให้ตรวจการ resolve front series")
+        watch_bits.append(f"error {error_count} ซ้ำ 2 รอบติด → ตรวจ API key/session")
+    watch_bits.append("options contracts หลุดจากที่เคยเห็น → ตรวจ resolve front series")
+    rep.add_watch(" · ".join(watch_bits))
 
     return rep.build_telegram()
 
@@ -1096,12 +1127,16 @@ def send_critical_error_alert(
 
     now_bkk_str = datetime.now(BANGKOK_TZ).strftime("%Y-%m-%d %H:%M:%S")
     rep = Report(
-        title="TFEX INTRADAY COLLECTOR: CRITICAL FAILURE",
-        subtitle=f"เกิดเมื่อ {now_bkk_str}",
+        title="🚨 Intraday: CRITICAL FAILURE",
+        subtitle=now_bkk_str,
+        icon="",
+        measured_heading=None,
+        plan_heading=None,
+        show_divider=False,
     )
-    rep.add_measured(bullet(f"<b>Error:</b> ❌ {error_title}"))
-    rep.add_measured(bullet(f"<b>Details:</b> <code>{error_detail}</code>"))
-    rep.add_watch("ตรวจ Turso Database และ Settrade Open API · alert ถัดไปถูกจำกัดด้วย cooldown 15 นาที")
+    rep.add_measured(f"📏 <b>{error_title}</b>")
+    rep.add_measured(f"📏 <code>{error_detail}</code>")
+    rep.add_watch("ตรวจ Turso / Settrade Open API · alert ถัดไปถูกจำกัดด้วย cooldown 15 นาที")
     return send_telegram_message(telegram_bot_token, telegram_chat_id, rep.build_telegram())
 
 
