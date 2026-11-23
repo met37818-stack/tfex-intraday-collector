@@ -73,3 +73,37 @@ jobs:
             echo "[RUNNER] Scheduled trigger: Starting persistent session worker..."
             python collector.py --session
           fi
+
+      - name: Report runner failure to Telegram
+        # The application sends its own 🚨 when an exception passes through its entry
+        # point. This step catches what that cannot: a timeout, a cancelled run, or a
+        # process killed before the collector reached its own error handling. Uses only
+        # curl, so it still works when the pip install step is what failed.
+        if: failure() || cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "[RUNNER] no Telegram credentials; skipping runner-failure notice"
+            exit 0
+          fi
+          TEXT="🚨 ${WORKFLOW_NAME}
+          runner ปิดงานแบบไม่ปกติ: ${RUN_STATUS}
+          สาเหตุที่เป็นไปได้: timeout / ถูกยกเลิก / process ตายก่อนถึง entry point
+          (ถ้าได้รับ 🚨 จากตัวแอปไปแล้ว ข้อความนี้คือ fallback ของ runner)
+          ${RUN_URL}"
+          echo "[RUNNER] sending runner-failure notice (status=${RUN_STATUS})"
+          # -f so an HTTP 4xx counts as a failure; the file is a Telegram error
+          # envelope (no token) and only its presence is logged.
+          if curl -fsS --max-time 15 -o /tmp/tg_runner_failure.json \
+               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+               --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+               --data-urlencode "text=${TEXT}"; then
+            echo "[RUNNER] runner-failure notice delivered"
+          else
+            echo "[RUNNER] runner-failure notice not delivered (non-fatal)"
+          fi
